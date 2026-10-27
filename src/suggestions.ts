@@ -4,9 +4,10 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import type { Files } from './files.ts';
+import { basename, dirname, join } from 'node:path';
+import { pathKey, type Files } from './files.ts';
 import type { ReleaseError } from './release.ts';
+import type { createAppData } from './appdata.ts';
 import type {
   AppReason, Emit, MemoryState, QuickCleanCategory, ReleaseResponse, Suggestion, SuggestionDraft, SuggestionItem, SuggestionKind,
 } from './types.ts';
@@ -17,6 +18,7 @@ export type SuggestionsDeps = {
   getState: () => MemoryState | null;
   release: (keys: string[]) => Promise<ReleaseResponse | ReleaseError>;
   emit: Emit;
+  appData?: Pick<ReturnType<typeof createAppData>, 'preview' | 'clean'>;
   now?: () => number;   // só para testes
 };
 export type SuggestionError = { erro: string; status: number };
@@ -24,7 +26,7 @@ export type SuggestionError = { erro: string; status: number };
 const KEEP = 100;
 const MAX_FILES = 500;
 const MAX_APPS = 100;
-const KINDS: readonly SuggestionKind[] = ['lixeira', 'limpeza_rapida', 'liberar_memoria'];
+const KINDS: readonly SuggestionKind[] = ['lixeira', 'limpeza_rapida', 'liberar_memoria', 'dados_apps'];
 const DAY = 86_400_000;
 const TTL = 3_600_000;   // M5: cartão pendente vale 1 h
 /** Motivo gravado em quem expirou. O vigia usa para saber que ninguém disse "não" (R30). */
@@ -98,7 +100,7 @@ export function createSuggestions(deps: SuggestionsDeps) {
     if (paths.length > MAX_FILES) return err(`são arquivos demais (o máximo é ${MAX_FILES})`);
     const scan = deps.files.last();   // M5: só vale o que a última busca de arquivos parados achou
     if (!scan) return err('faça uma busca de arquivos parados antes');
-    const found = new Set(scan.files.map(f => f.path.toLowerCase()));
+    const found = new Set(scan.files.map(f => pathKey(f.path)));
     const checked = await deps.files.inspect(paths);
     const out: SuggestionItem[] = [];
     const seen = new Set<string>();
@@ -106,12 +108,12 @@ export function createSuggestions(deps: SuggestionsDeps) {
       const c = checked[i]!;
       // um item inválido recusa a sugestão inteira (R21); a mensagem não repete o caminho (R17)
       if ('erro' in c) return err(`o item ${i + 1} foi recusado: ${c.erro}`);
-      const key = c.path.toLowerCase();
+      const key = pathKey(c.path);
       if (!found.has(key)) return err(`o item ${i + 1} foi recusado: não está na última busca de arquivos parados`);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push({
-        id: c.path, label: c.path.slice(c.path.lastIndexOf('\\') + 1),
+        id: c.path, label: basename(c.path),
         detail: `${folderOf(c.path)} · último uso há ${since(now() - c.lastUsed)}`, bytes: c.size, lastUsed: c.lastUsed,
       });
     }
@@ -144,6 +146,27 @@ export function createSuggestions(deps: SuggestionsDeps) {
     return out.length ? out : err('não há nada para limpar agora', 409);
   }
 
+  /** Dados dos apps: cada id tem de ser item ACIONÁVEL do preview do servidor (allowlist recalculada das regras). */
+  async function buildAppData(ids: string[]): Promise<SuggestionItem[] | SuggestionError> {
+    if (ids.length === 0) return err('nenhum cache na sugestão');
+    if (ids.length > MAX_APPS) return err('são caches demais');
+    if (!deps.appData) return err('dados dos apps indisponível', 503);
+    const scan = await deps.appData.preview();
+    const byId = new Map(scan.entries.flatMap(e => e.items).map(i => [i.id, i]));
+    const out: SuggestionItem[] = [];
+    const seen = new Set<string>();
+    for (let n = 0; n < ids.length; n++) {
+      const it = byId.get(ids[n]!);
+      // a mensagem não repete o id pedido (R17)
+      if (!it) return err(`o item ${n + 1} foi recusado: não é um cache que o Folga limpa`);
+      if (!it.actionable) return err(`o item ${n + 1} foi recusado: ${it.note ?? 'não pode ser limpo agora'}`);
+      if (seen.has(it.id)) continue;
+      seen.add(it.id);
+      out.push({ id: it.id, label: it.label, detail: `${it.path} · ${plural(it.files, 'arquivo', 'arquivos')}`, bytes: it.bytes });
+    }
+    return out;
+  }
+
   // ---------- add ----------
   async function add(draft: SuggestionDraft, source: Suggestion['source']): Promise<Suggestion | SuggestionError> {
     const d = draft as Partial<SuggestionDraft> | null;
@@ -158,8 +181,11 @@ export function createSuggestions(deps: SuggestionsDeps) {
     if (BAD_TITLE.test(title) || BAD_REASON.test(reason)) return err('o texto tem caracteres inválidos');
     if (kind !== 'limpeza_rapida' && (!Array.isArray(d.items) || d.items.some(x => typeof x !== 'string'))) return err('a lista de itens é inválida');
     const given = (kind === 'limpeza_rapida' ? [] : d.items) as string[];
+    // decisão 11: tela e assistente propõem; o vigia não propõe apagar dados de app
+    if (kind === 'dados_apps' && source === 'vigia') return err('o vigia não propõe limpeza de dados dos apps');
 
-    const built = kind === 'lixeira' ? await buildFiles(given) : kind === 'liberar_memoria' ? buildApps(given, source) : await buildClean();
+    const built = kind === 'lixeira' ? await buildFiles(given) : kind === 'liberar_memoria' ? buildApps(given, source)
+      : kind === 'dados_apps' ? await buildAppData(given) : await buildClean();
     if (!Array.isArray(built)) return built;
 
     const s: Suggestion = {
@@ -183,7 +209,8 @@ export function createSuggestions(deps: SuggestionsDeps) {
       let status: 'feita' | 'falhou';
       let result: string;
       try {
-        ({ status, result } = s.kind === 'lixeira' ? await runFiles(s) : s.kind === 'liberar_memoria' ? await runApps(s) : await runClean(s));
+        ({ status, result } = s.kind === 'lixeira' ? await runFiles(s) : s.kind === 'liberar_memoria' ? await runApps(s)
+          : s.kind === 'dados_apps' ? await runAppData(s) : await runClean(s));
       } catch {
         status = 'falhou'; result = 'Algo deu errado e nada foi feito.';   // sem detalhe interno (R17)
       }
@@ -208,8 +235,8 @@ export function createSuggestions(deps: SuggestionsDeps) {
     const changed = s.items.findIndex((it, i) => good[i]!.size !== it.bytes || good[i]!.lastUsed > (it.lastUsed ?? -Infinity));
     if (changed !== -1) return { status: 'falhou', result: `Nada foi enviado: o arquivo ${s.items[changed]!.label} foi usado ou mudou depois da sugestão.` };
     const r = await deps.files.recycle(good.map(g => g.path));
-    const okSet = new Set(r.ok.map(p => p.toLowerCase()));
-    const moved = good.filter(g => okSet.has(g.path.toLowerCase()));
+    const okSet = new Set(r.ok.map(p => pathKey(p)));
+    const moved = good.filter(g => okSet.has(pathKey(g.path)));
     const bytes = moved.reduce((a, g) => a + g.size, 0);
     const parts: string[] = [];
     if (moved.length) {
@@ -217,7 +244,7 @@ export function createSuggestions(deps: SuggestionsDeps) {
       const gone = plural(moved.length, 'arquivo', 'arquivos');
       if (r.inTrash === null) parts.push(`${gone} saíram da pasta · ${size(bytes)} (não deu para conferir a Lixeira)`);
       else if (r.inTrash >= moved.length) parts.push(`${gone} na Lixeira · ${size(bytes)}`);
-      else parts.push(`${plural(moved.length, 'arquivo saiu', 'arquivos saíram')} da pasta; só ${nf0.format(r.inTrash)} ${r.inTrash === 1 ? 'apareceu' : 'apareceram'} na Lixeira (o Windows pode ter pedido para apagar de vez)`);
+      else parts.push(`${plural(moved.length, 'arquivo saiu', 'arquivos saíram')} da pasta; só ${nf0.format(r.inTrash)} ${r.inTrash === 1 ? 'apareceu' : 'apareceram'} na Lixeira (${process.platform === 'darwin' ? 'o macOS não confirmou os outros' : 'o Windows pode ter pedido para apagar de vez'})`);
     }
     if (r.failed.length) parts.push(`${plural(r.failed.length, 'arquivo não pôde', 'arquivos não puderam')} ir para a Lixeira`);
     return { status: moved.length ? 'feita' : 'falhou', result: parts.join('. ') };
@@ -243,6 +270,19 @@ export function createSuggestions(deps: SuggestionsDeps) {
     if (bad) return { status: 'falhou', result: 'Nada foi apagado: uma das categorias não pode mais ser limpa agora (o navegador foi aberto?).' };
     const r = await deps.files.quickClean({ categories: cats });   // só as categorias que o cartão mostrava
     const kept = r.skipped ? ` · ${plural(r.skipped, 'em uso ficou', 'em uso ficaram')}` : '';
+    return { status: 'feita', result: `${plural(r.files, 'arquivo apagado', 'arquivos apagados')} · ${size(r.bytes)}${kept}` };
+  }
+
+  async function runAppData(s: Suggestion): Promise<Outcome> {
+    // R21, para qualquer origem: o clean recalcula os alvos das regras e rejulga cada um (id forjado, app aberto → pulado);
+    // sem preview novo, que mediria a Library inteira só para conferir o que o clean já confere
+    // decisão 11 vale também para cartão vindo do arquivo (adulterado): o vigia nunca apaga dados de app
+    if (s.source === 'vigia') return { status: 'falhou', result: 'Nada foi apagado: o vigia não propõe limpeza de dados dos apps.' };
+    if (!deps.appData) return { status: 'falhou', result: 'Nada foi apagado: dados dos apps indisponível.' };
+    const ids = [...new Set(s.items.map(i => i.id))];   // o clean conta os pulados sobre ids sem repetição
+    const r = await deps.appData.clean(ids);
+    if (r.skipped >= ids.length) return { status: 'falhou', result: 'Nada foi apagado: um dos apps foi aberto ou o cache mudou.' };
+    const kept = r.skipped ? ` · ${plural(r.skipped, 'cache ficou', 'caches ficaram')}` : '';
     return { status: 'feita', result: `${plural(r.files, 'arquivo apagado', 'arquivos apagados')} · ${size(r.bytes)}${kept}` };
   }
 

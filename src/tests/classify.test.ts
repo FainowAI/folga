@@ -3,6 +3,7 @@ import { appKey, classify, emptyHistory } from '../classify.ts';
 import type { ClassifyContext, ClassifyHistory } from '../classify.ts';
 import type { AppGroup, ProbeProcess, ProbeSnapshot, Settings } from '../types.ts';
 import { DEFAULT_SETTINGS } from '../types.ts';
+import { defaultSettings } from '../platform.ts';
 
 const MIN = 60_000;
 const MB = 1024 * 1024;
@@ -302,6 +303,27 @@ caso('R36: só motivo no_window ganha pai', () => {
   const r = classify(snapOf([proc('chrome.exe'), proc('explorer.exe')], t), emptyHistory(), settings, ctxAt(t));
   assert.equal(find(r, 'chrome').parents, undefined);     // idle
   assert.equal(find(r, 'explorer').parents, undefined);   // system
+});
+
+caso('Mac: helpers somam no bundle; Dock é sistema; Terminal nunca fecha', () => {
+  const chrome = proc('com.google.Chrome', { description: 'Google Chrome', session: 501 });
+  const helper = proc('com.google.Chrome', { description: 'Google Chrome', session: 501, hasVisibleWindow: false, ppid: chrome.pid });
+  const r = classify(snapOf([chrome, helper, proc('com.apple.dock', { description: 'Dock', session: 501 }),
+    proc('com.apple.Terminal', { description: 'Terminal', session: 501 })], T0 + 60 * MIN),
+    emptyHistory(), defaultSettings('darwin'), ctxAt(T0 + 60 * MIN, { userSession: 501 }));
+  assert.deepEqual(find(r, 'com.google.chrome').pids, [chrome.pid, helper.pid]);
+  assert.equal(find(r, 'com.google.chrome').name, 'Google Chrome');
+  assert.equal(find(r, 'com.google.chrome').state, 'idle');
+  assert.equal(find(r, 'com.apple.dock').reason, 'system');
+  assert.equal(find(r, 'com.apple.terminal').reason, 'never_close');
+});
+
+caso('Mac R29: Chrome pelo bundle id com 3 janelas, parado há 2 h -> in_use/multi_window; 1 janela -> idle', () => {
+  const t = T0 + 2 * 60 * MIN;
+  const mac = (windowCount: number) => find(classify(snapOf([proc('com.google.Chrome', { description: 'Google Chrome', session: 501, windowCount })], t),
+    emptyHistory(), defaultSettings('darwin'), ctxAt(t, { userSession: 501 })), 'com.google.chrome');
+  assert.deepEqual([mac(3).state, mac(3).reason, mac(3).windows], ['in_use', 'multi_window', 3]);
+  assert.deepEqual([mac(1).state, mac(1).reason], ['idle', 'idle']);
 });
 
 casos.forEach((c) => console.log('ok  ' + c));

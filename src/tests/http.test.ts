@@ -1,17 +1,21 @@
 // Servidor real numa porta alta, com pasta de dados temporária e sonda falsa (R15–R17, R07–R09, R14).
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_SETTINGS, type LogEntry, type MemoryState, type ReleaseResponse, type Settings, type Warning } from '../types.ts';
+import { defaultSettings } from '../platform.ts';
+import { type LogEntry, type MemoryState, type ReleaseResponse, type Settings, type Warning } from '../types.ts';
 
 const PORT = 18000 + Math.floor(Math.random() * 1000);
 const dataDir = mkdtempSync(join(tmpdir(), 'folga-http-'));
 const startupDir = mkdtempSync(join(tmpdir(), 'folga-início-'));   // nunca a pasta Inicializar real; acento como em C:\Users\Antônio
 const filesRoot = mkdtempSync(join(tmpdir(), 'folga-files-'));   // varredura de teste: pasta vazia, nunca as pastas reais do usuário
+const appBase = mkdtempSync(join(tmpdir(), 'folga-appdata-'));   // dados dos apps de teste: nunca o ~/Library real
+mkdirSync(join(appBase, 'Claude', 'Cache'), { recursive: true });
+writeFileSync(join(appBase, 'Claude', 'Cache', 'f'), 'x'.repeat(4096));
 const root = join(import.meta.dirname, '..', '..');
 // já no disco antes de subir: ui-token curto demais (B5) e settings.json com valor que iria para o comando da sonda (B7)
 writeFileSync(join(dataDir, 'ui-token'), 'curto');
@@ -19,9 +23,10 @@ writeFileSync(join(dataDir, 'settings.json'), JSON.stringify({ sampleSeconds: "2
 
 const server = spawn(process.execPath, ['--no-warnings', join(root, 'src', 'server.ts')], {
   env: {
-    ...process.env, FOLGA_PORT: String(PORT), FOLGA_DATA_DIR: dataDir,
+    ...process.env, FOLGA_NOTIFY: '0', FOLGA_PORT: String(PORT), FOLGA_DATA_DIR: dataDir,
     FOLGA_FAKE_PROBE: join(root, 'src', 'tests', 'fake-probe.mjs'),
     FOLGA_FILES_ROOTS: filesRoot, FOLGA_CLOSE_WAIT_MS: '300', FOLGA_MEASURE_WAIT_MS: '300', FOLGA_STARTUP_DIR: startupDir,
+    FOLGA_APPDATA_BASES: JSON.stringify({ appSupport: appBase, roamingAppData: appBase }),
   },
   stdio: ['ignore', 'pipe', 'inherit'],
 });
@@ -64,7 +69,7 @@ try {
   ok('estado: notepad candidato, explorer e svchost protegidos');
 
   // B7: o settings.json do disco passa pela mesma validação do PUT; inválido volta aos padrões (e o valor nunca chega à sonda)
-  assert.deepEqual((await call('GET', '/api/settings')).body, DEFAULT_SETTINGS);
+  assert.deepEqual((await call('GET', '/api/settings')).body, defaultSettings());
   ok('B7: settings.json inválido no disco → padrões');
 
   // R34: voltar aos padrões não pode ser silencioso, e salvar em Ajustes (o que o aviso manda fazer) tem que resolver
@@ -89,24 +94,19 @@ try {
   assert.equal((await call('POST', '/api/release', { body: { keys: ['notepad'] } })).status, 403);
   ok('R16: sem token 403, sem JSON 415');
 
-  // M6: o agente tem token próprio (novo a cada início), que só vale na varredura de arquivos
-  const agentToken = readFileSync(join(dataDir, 'agent-token'), 'utf8').trim();
-  assert.match(agentToken, /^[0-9a-f]{64}$/);
-  assert.notEqual(agentToken, token);
-  const scan = await call('POST', '/api/files/scan', { body: {}, token: agentToken });
-  assert.equal(scan.status, 200);
-  assert.deepEqual(scan.body.files, []);
+  // M6: o agente tem token próprio, que só existe durante um turno (arquivo criado e apagado pelo servidor; o
+  // turno em si está em agent.test). Parado, não há agent-token no disco e nenhum valor antigo vale.
+  assert.ok(!existsSync(join(dataDir, 'agent-token')), 'sem turno do assistente não há agent-token no disco');
   assert.equal((await call('POST', '/api/files/scan', { body: {}, token })).status, 200, 'o ui-token continua valendo na varredura');
   assert.equal((await call('POST', '/api/files/scan', { body: {}, token: 'x'.repeat(64) })).status, 403);
-  for (const [method, path, body] of [
-    ['POST', '/api/suggestions/abc-1/approve', {}], ['POST', '/api/suggestions/abc-1/ignore', {}], ['POST', '/api/suggestions', {}],
-    ['POST', '/api/release', { keys: ['notepad'] }], ['PUT', '/api/settings', { idleMinutes: 10 }], ['PUT', '/api/startup', { on: true }],
-    ['POST', '/api/agent/message', { provider: 'claude', text: 'oi' }], ['POST', '/api/agent/reset', {}], ['POST', '/api/window', {}],
-  ] as const) {
-    assert.equal((await call(method, path, { body, token: agentToken })).status, 403, `${method} ${path} com o agent-token`);
+  ok('M6: agent-token só durante o turno; varredura com o ui-token, token qualquer dá 403');
+
+  if (process.platform === 'darwin') {
+    const w = await call('POST', '/api/window', { body: {}, token });
+    assert.equal(w.status, 409);
+    assert.equal(w.body.erro, 'abra pelo app Folga na barra de menus');
+    ok('Mac: POST /api/window → 409 "abra pelo app Folga na barra de menus" (nada de Edge)');
   }
-  assert.ok(!existsSync(join(startupDir, 'Folga.lnk')), 'nada foi executado');
-  ok('M6: agent-token passa só em POST /api/files/scan; aprovar, liberar, ajustes e o resto dão 403');
 
   const good = await call('PUT', '/api/settings', { body: { idleMinutes: 10, neverClose: ['Code.exe'] }, token });
   assert.equal(good.status, 200);
@@ -119,6 +119,18 @@ try {
     assert.ok(!String(r.body.erro).includes('\\'), 'R17: erro sem caminho');
   }
   ok('PUT /api/settings valida faixa, tipo e campo, e grava settings.json');
+
+  // a sonda do Windows não lê pressão de memória: gatilho por pressão lá seria um Auto Care que nunca dispara
+  const pressao = await call('PUT', '/api/settings', { body: { autoCareTrigger: 'pressure' }, token });
+  if (process.platform === 'win32') {
+    assert.equal(pressao.status, 400);
+    assert.match(String(pressao.body.erro), /Windows/);
+    assert.equal((await call('GET', '/api/settings')).body.autoCareTrigger, 'percent');
+  } else {
+    assert.equal(pressao.status, 200);
+    assert.equal((await call('PUT', '/api/settings', { body: { autoCareTrigger: 'percent' }, token })).status, 200);
+  }
+  ok(`PUT autoCareTrigger pressure: 400 no Windows, aceito fora dele (aqui: ${process.platform})`);
 
   // R34: o PUT acima gravou um arquivo válido, então o aviso tem que sair sozinho, sem reiniciar o Folga
   assert.deepEqual(await avisos(), [], 'salvar em Ajustes tira o aviso "seus ajustes não foram lidos"');
@@ -145,11 +157,126 @@ try {
 
   assert.equal((await call('GET', '/api/startup')).body.on, false);
   assert.equal((await call('PUT', '/api/startup', { body: { on: true } })).status, 403);
-  assert.equal((await call('PUT', '/api/startup', { body: { on: true }, token })).body.on, true);
-  assert.ok(existsSync(join(startupDir, 'Folga.lnk')));
+  if (process.platform === 'win32') {
+    assert.equal((await call('PUT', '/api/startup', { body: { on: true }, token })).body.on, true);
+    assert.ok(existsSync(join(startupDir, 'Folga.lnk')));
+  }
   assert.equal((await call('PUT', '/api/startup', { body: { on: false }, token })).body.on, false);
   assert.ok(!existsSync(join(startupDir, 'Folga.lnk')));
   ok('P04: atalho de inicialização liga e desliga (pasta temporária)');
+  if (process.platform !== 'win32') {
+    for (const t of ['ui-token']) assert.equal(statSync(join(dataDir, t)).mode & 0o777, 0o600, t);
+    ok('tokens gravados em 0600');
+  }
+
+  if (process.platform === 'darwin') {
+    // Mac: LaunchAgent só dentro do app (FOLGA_APP=1); sem ele o interruptor não existe e nada é escrito
+    const plist = join(startupDir, 'local.folga.app.plist');
+    assert.deepEqual((await call('GET', '/api/startup')).body, { on: false, available: false });
+    assert.equal((await call('PUT', '/api/startup', { body: { on: true }, token })).status, 409);
+    assert.ok(!existsSync(plist), 'sem FOLGA_APP nada é criado');
+
+    const appStartup = async (appPath: string | undefined, fn: (c: (m: string, p: string, body?: unknown) => Promise<Res>, dir: string, x: { port: number; data: string; tk: string }) => Promise<void>,
+      opts: { env?: Record<string, string>; settings?: string } = {}) => {
+      const port = PORT + 1001 + Math.floor(Math.random() * 500);
+      const dir = mkdtempSync(join(tmpdir(), 'folga-launchagents-'));
+      const data = mkdtempSync(join(tmpdir(), 'folga-http-app-'));
+      const env: Record<string, string | undefined> = { ...process.env, FOLGA_NOTIFY: '0', FOLGA_PORT: String(port), FOLGA_DATA_DIR: data, FOLGA_STARTUP_DIR: dir,
+        FOLGA_FAKE_PROBE: join(root, 'src', 'tests', 'fake-probe.mjs'), FOLGA_APP: '1', FOLGA_APP_PATH: appPath };
+      if (appPath === undefined) delete env.FOLGA_APP_PATH;
+      Object.assign(env, opts.env);
+      if (opts.settings !== undefined) writeFileSync(join(data, 'settings.json'), opts.settings);
+      const child = spawn(process.execPath, ['--no-warnings', join(root, 'src', 'server.ts')], { env, stdio: ['pipe', 'ignore', 'inherit'] });   // stdin em pipe: FOLGA_APP=1 sai quando ele fecha
+      const tk = 'ab'.repeat(32);
+      child.stdin!.write(tk + '\n');   // como o Folga.app: o token chega na 1ª linha do stdin, nunca por arquivo
+      try {
+        let up = false;
+        for (let i = 0; i < 100 && !up; i++) {
+          try { up = (await fetch(`http://127.0.0.1:${port}/api/settings`, { headers: { 'x-folga-token': tk } })).status === 200; } catch { await sleep(100); }
+          if (!up) await sleep(50);
+        }
+        assert.ok(up, 'servidor do app não subiu');
+        await fn(async (m, p, body) => {
+          const r = await fetch(`http://127.0.0.1:${port}${p}`, { method: m, headers: { 'x-folga-token': tk, 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+          return { status: r.status, body: await r.json().catch(() => null), headers: {} };
+        }, dir, { port, data, tk });
+      } finally { child.kill('SIGKILL'); await rm(dir, { recursive: true, force: true }); await rm(data, { recursive: true, force: true, maxRetries: 5 }); }
+    };
+
+    // revisão de segurança: dentro do app a chave nunca vai para o disco e nenhuma /api/ responde sem ela
+    await appStartup('/Users/x/Applications/Folga.app', async (_c, _dir, { port, data, tk }) => {
+      const get = (p: string, h: Record<string, string> = {}) => fetch(`http://127.0.0.1:${port}${p}`, { headers: h }).then(r => r.status);
+      assert.ok(!existsSync(join(data, 'ui-token')), 'ui-token não pode existir no disco dentro do app');
+      assert.ok(!existsSync(join(data, 'agent-token')), 'agent-token só existe durante um turno do assistente');
+      for (const p of ['/api/token', '/api/state', '/api/files/stale', '/api/suggestions', '/api/agent']) {
+        assert.equal(await get(p), 403, `${p} sem token`);
+        assert.equal(await get(p, { 'x-folga-token': 'cd'.repeat(32) }), 403, `${p} com token errado`);
+      }
+      assert.equal(await get('/api/token', { cookie: `folga_t=${tk}` }), 200, 'a janela (cookie) pega o token');
+      assert.equal(await get('/api/state', { cookie: `outro=1; folga_t=${tk}` }), 200, 'cookie entre outros');
+      assert.notEqual(await get('/', {}), 403, 'a página em si não pede token (404 na CI, que não monta a interface)');
+    });
+    ok('segurança (app): token só na memória; /api/ inteira recusa sem token, cookie da janela passa');
+
+    await appStartup('/Users/x/Applications/Fol&ga.app', async (c, dir) => {
+      const file = join(dir, 'local.folga.app.plist');
+      assert.deepEqual((await c('GET', '/api/startup')).body, { on: false, available: true });
+      assert.deepEqual((await c('PUT', '/api/startup', { on: true })).body, { on: true });
+      assert.deepEqual((await c('GET', '/api/startup')).body, { on: true, available: true });
+      const lint = spawnSync('/usr/bin/plutil', ['-lint', file], { encoding: 'utf8' });
+      assert.equal(lint.status, 0, lint.stdout + lint.stderr);
+      const j = JSON.parse(spawnSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf8' }).stdout);
+      assert.equal(j.Label, 'local.folga.app');
+      assert.deepEqual(j.ProgramArguments, ['/Users/x/Applications/Fol&ga.app/Contents/MacOS/Folga', '--login']);
+      assert.equal(j.RunAtLoad, true);
+      assert.equal(j.LimitLoadToSessionType, 'Aqua');
+      assert.equal(j.ProcessType, 'Interactive');
+      assert.ok(readFileSync(file, 'utf8').includes('Fol&amp;ga.app'), '& escapado no XML');
+      assert.deepEqual((await c('PUT', '/api/startup', { on: false })).body, { on: false });
+      assert.ok(!existsSync(file));
+    });
+    await appStartup(`/Users/x/A<b>"c'd.app`, async (c, dir) => {
+      const file = join(dir, 'local.folga.app.plist'), alvo = join(dir, 'alvo');
+      writeFileSync(alvo, 'intacto');
+      symlinkSync(alvo, file);   // link plantado no lugar do plist: trocado, nunca seguido
+      assert.deepEqual((await c('PUT', '/api/startup', { on: true })).body, { on: true });
+      assert.equal(readFileSync(alvo, 'utf8'), 'intacto');
+      assert.ok(!lstatSync(file).isSymbolicLink());
+      assert.equal(statSync(file).mode & 0o777, 0o600);
+      const j = JSON.parse(spawnSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf8' }).stdout);
+      assert.deepEqual(j.ProgramArguments, [`/Users/x/A<b>"c'd.app/Contents/MacOS/Folga`, '--login']);
+      assert.ok(readFileSync(file, 'utf8').includes('A&lt;b&gt;&quot;c&apos;d.app'), '< > " \' escapados no XML');
+    });
+
+    // I2: aviso crítico ('ajustes' com settings.json torto) num servidor de teste não dispara processo de notificação.
+    // O Folga.app aqui é falso: só anota num arquivo que foi chamado. Controle positivo prova que o teste enxerga o disparo.
+    const fake = mkdtempSync(join(tmpdir(), 'folga-fakeapp-'));
+    try {
+      const app = join(fake, 'Folga.app'), bin = join(app, 'Contents', 'MacOS');
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, 'Folga'), '#!/bin/sh\necho "$@" >> "$FOLGA_TEST_MARK"\n', { mode: 0o755 });
+      const disparos = async (notifyEnv: string) => {
+        const mark = join(fake, `mark-${notifyEnv || 'on'}`);
+        await appStartup(app, async c => {
+          for (let i = 0; i < 30 && !existsSync(mark); i++) {
+            if (notifyEnv === '0' && (await c('GET', '/api/warnings')).body.some((w: Warning) => w.kind === 'ajustes')) { await sleep(1500); break; }
+            await sleep(100);
+          }
+        }, { env: { FOLGA_NOTIFY: notifyEnv, FOLGA_TEST_MARK: mark }, settings: '{ torto' });
+        return existsSync(mark) ? readFileSync(mark, 'utf8') : '';
+      };
+      assert.equal(await disparos(''), '--notify\n', 'controle: sem FOLGA_NOTIFY=0 o aviso crítico chama o app (falso)');
+      assert.equal(await disparos('0'), '', 'FOLGA_NOTIFY=0: nenhum processo de notificação');
+    } finally { await rm(fake, { recursive: true, force: true }); }
+    ok('I2: servidor de teste com FOLGA_NOTIFY=0 não dispara notificação; sem ele, dispara (controle)');
+    for (const ruim of ['relativo/Folga.app', '/Users/x/Folga', undefined, '/Users/x/F\x01.app', '/Users/x/F\n.app', '/Users/x/F\x1f.app']) {
+      await appStartup(ruim, async (c, dir) => {
+        assert.equal((await c('PUT', '/api/startup', { on: true })).status, 409, String(ruim));
+        assert.ok(!existsSync(join(dir, 'local.folga.app.plist')));
+      });
+    }
+    ok('P04 Mac: LaunchAgent só com FOLGA_APP=1, plist válido e escapado, caminho torto → 409');
+  }
 
   // A1: percent-encoding inválido derrubava o servidor (URIError numa rejeição não tratada)
   for (const bad of ['/%', '/%E0%A4%A', '/assets/%zz', '/%C0%80%']) assert.equal((await call('GET', bad)).status, 400, bad);
@@ -175,6 +302,13 @@ try {
   assert.ok([200, 404].includes(seguras[0]!.status));
   ok('M1: X-Frame-Options, nosniff e CSP em resposta estática, JSON e de erro');
 
+  // dados dos apps: medição pelas bases de teste; cartão de limpeza sem token é recusado
+  const ad = await call('GET', '/api/appdata');
+  assert.equal(ad.status, 200);
+  assert.ok(Array.isArray(ad.body.entries) && ad.body.entries.some((e: any) => e.name === 'Claude'));
+  assert.equal((await call('POST', '/api/suggestions', { body: { kind: 'dados_apps', title: 'x', reason: '', items: ['claude:Cache'] } })).status, 403);
+  ok('GET /api/appdata mede as bases de teste; POST dados_apps sem token → 403');
+
   // B5b: requisição que outro site dispara (ex.: uma imagem embutida noutro site) é recusada em /api/*
   for (const p of ['/api/state', '/api/disk', '/api/quickclean', '/api/token']) {
     assert.equal((await call('GET', p, { headers: { 'sec-fetch-site': 'cross-site' } })).status, 403, p);
@@ -190,4 +324,5 @@ try {
   await rm(dataDir, { recursive: true, force: true, maxRetries: 5 });
   await rm(startupDir, { recursive: true, force: true, maxRetries: 5 });
   await rm(filesRoot, { recursive: true, force: true, maxRetries: 5 });
+  await rm(appBase, { recursive: true, force: true, maxRetries: 5 });
 }

@@ -1,6 +1,6 @@
 // Fonte falsa com a MESMA forma da real (F-03 só troca a importação no App.tsx).
 import { DEFAULT_SETTINGS } from '../../src/types';
-import type { AppGroup, MemoryState, Outcome, ReleaseResponse, ReleaseResult } from '../../src/types';
+import type { AppDataScan, AppGroup, DiskInfo, MemoryState, QuickCleanItem, StaleScan, Outcome, ReleaseResponse, ReleaseResult } from '../../src/types';
 
 export type Source = {
   subscribe(onState: (s: MemoryState) => void): () => void;
@@ -12,6 +12,7 @@ const GB = 1024 ** 3;
 const MIN = 60_000;
 const TOTAL = 16 * GB;
 const startedAt = Date.now() - 5 * 60 * MIN;
+const MAC = /Mac/.test(navigator.platform);   // no Mac a sonda manda pressão e swap, e o Auto Care é por pressão
 
 type Seed = Pick<AppGroup, 'key' | 'name' | 'state' | 'reason'> & {
   n: number; mb: number; cpu?: number; focusedMinAgo?: number | null;
@@ -66,8 +67,9 @@ function snapshot(): MemoryState {
   return {
     t, memLoad: Math.round((used / TOTAL) * 100), totalPhys: TOTAL, availPhys: TOTAL - used,
     apps: apps.map((a) => (a.reason === 'foreground' ? { ...a, lastFocusedAt: t } : a)),
-    freed, settings: { ...DEFAULT_SETTINGS, autoCareEnabled: true },
+    freed, settings: { ...DEFAULT_SETTINGS, autoCareEnabled: true, ...(MAC && { autoCareTrigger: 'pressure' as const }) },
     startedAt, autoCare: { nextEligibleAt: null, lastRunAt: null },
+    ...(MAC && { memPressure: 'warn' as const, swapUsed: 4.5 * GB }),
   };
 }
 
@@ -120,3 +122,54 @@ export const mockSource: Source = {
     return { availBefore, availAfter: TOTAL - used, results };
   },
 };
+
+// Respostas falsas das leituras da tela Arquivos e do Início (só ?mock). undefined = vai para o servidor.
+// ponytail: só Mac (números do guia); no Windows cai no servidor como antes.
+export function mockRead(path: string): unknown {
+  if (!MAC) return undefined;
+  const t = Date.now();
+  if (path === '/api/disk') return [{ drive: 'Macintosh HD', total: 494 * GB, free: 38 * GB, purgeable: 21 * GB }] satisfies DiskInfo[];
+  if (path === '/api/appdata') {
+    const lib = '/Users/voce/Library';
+    return {
+      t, durationMs: 3400, truncated: false, totalBytes: 16.1 * GB,
+      entries: [
+        {
+          id: 'claude', name: 'Claude', where: `${lib}/Application Support/Claude`, bytes: 13 * GB,
+          items: [
+            { id: 'claude:code-cache', label: 'Cache de código', path: `${lib}/Application Support/Claude/Code Cache`, bytes: 0.4 * GB, files: 310, actionable: false, note: 'Claude aberto: feche para limpar' },
+            { id: 'claude:gpu-cache', label: 'Cache de vídeo', path: `${lib}/Application Support/Claude/GPUCache`, bytes: 120 * MB, files: 12, actionable: false, note: 'Claude aberto: feche para limpar' },
+          ],
+          notes: [{ text: 'Disco da máquina virtual do Claude: não é cache, o Folga não limpa', bytes: 12.4 * GB }],
+        },
+        {
+          id: 'chrome', name: 'Google Chrome', where: `${lib}/Application Support/Google/Chrome`, bytes: 1.7 * GB,
+          items: [
+            { id: 'chrome:gpu', label: 'Cache de vídeo', path: `${lib}/Application Support/Google/Chrome/GPUCache`, bytes: 1.4 * GB, files: 38, actionable: true },
+            { id: 'chrome:shader', label: 'Cache de sombreadores', path: `${lib}/Application Support/Google/Chrome/ShaderCache`, bytes: 0.3 * GB, files: 21, actionable: false, note: 'Chrome aberto: feche para limpar' },
+          ],
+          notes: [],
+        },
+      ],
+    } satisfies AppDataScan;
+  }
+  if (path === '/api/quickclean') {
+    return [
+      { category: 'temp_usuario', label: 'Temporários', bytes: 640 * MB, files: 1_820, actionable: true },
+      // como o servidor: Chrome medido e acionável; o Safari sem permissão só aparece na nota (nunca unknown no item)
+      { category: 'cache_navegador', label: 'Cache dos navegadores', bytes: 820 * MB, files: 2_400, actionable: true, note: 'Safari: Não deu para ler: o macOS protege esta pasta e o Folga não pede essa permissão.' },
+      { category: 'lixeira', label: 'Lixeira', bytes: 1.2 * GB, files: 96, actionable: false, note: 'o Folga não esvazia' },
+    ] as QuickCleanItem[];
+  }
+  if (path === '/api/files/stale') {
+    const d = 86_400_000;
+    return {
+      t, durationMs: 1800, roots: [], scanned: 4200, truncated: false, totalBytes: 2.3 * GB, olderThanDays: 180, minBytes: 10 * MB, accessTracking: true,
+      files: [
+        { path: '/Users/voce/Downloads/Instalador antigo.app', name: 'Instalador antigo.app', root: 'Downloads', size: 1.4 * GB, lastUsed: t - 400 * d, lastModified: t - 400 * d, basis: 'adicionado', isApp: true },
+        { path: '/Users/voce/Documents/Aula gravada.mov', name: 'Aula gravada.mov', root: 'Documents', size: 0.9 * GB, lastUsed: t - 250 * d, lastModified: t - 260 * d, basis: 'spotlight' },
+      ],
+    } satisfies StaleScan;
+  }
+  return undefined;
+}

@@ -26,6 +26,14 @@ await caso('a linha vem do Auto Care: 7 pontos antes dele, ou 85 % com ele desli
   assert.equal(memoryLine(set({ autoCareEnabled: false, autoCareThreshold: 92 })), 85);
 });
 
+await caso('modo pressão: a linha é a pressão amarela, não a porcentagem', () => {
+  const pr = set({ autoCareTrigger: 'pressure' });
+  assert.ok(memoryPlan({ ...mem(10, [app('chrome', 900)]), memPressure: 'warn' }, pr));
+  assert.equal(memoryPlan({ ...mem(10, [app('chrome', 900)]), memPressure: 'normal' }, pr), null);
+  assert.equal(memoryPlan(mem(99, [app('chrome', 900)]), pr), null);   // sem pressão (Windows): quieto
+  assert.equal(memoryPlan({ ...mem(10, [app('chrome', 900)]), memPressure: 'warn' }, set({ autoCareTrigger: 'percent' })), null);   // percentual: nada muda
+});
+
 await caso('abaixo da linha, ou com pouca coisa parada, não propõe', () => {
   assert.equal(memoryPlan(mem(84, [app('chrome', 900)]), DEFAULT_SETTINGS), null);
   assert.equal(memoryPlan(mem(90, [app('chrome', 100)]), DEFAULT_SETTINGS), null);   // 100 MB < 500 MB
@@ -54,8 +62,11 @@ await caso('o cartão de memória diz a porcentagem, o tamanho e que o app pode 
 
 await caso('disco: o do sistema, a porcentagem livre e o mínimo de 1 GB para valer o cartão', () => {
   const c: DiskInfo = { drive: 'C:', total: 100 * GB, free: 8 * GB };
-  assert.deepEqual(systemDisk([{ drive: 'D:', total: 1, free: 1 }, c]), c);
+  if (process.platform === 'win32') assert.deepEqual(systemDisk([{ drive: 'D:', total: 1, free: 1 }, c]), c);
   assert.equal(systemDisk([]), null);
+  const mac = { drive: 'Macintosh HD', total: 1, free: 1 };
+  assert.deepEqual(systemDisk([mac]), mac);
+  if (process.platform !== 'win32') assert.deepEqual(systemDisk([mac, c]), mac);   // fora do Windows é o primeiro
   assert.equal(Math.round(diskFreePct(c)), 8);
   const pouco: QuickCleanItem[] = [{ category: 'temp_usuario', label: 'Temporários', bytes: 50 * MB, files: 9, actionable: true }];
   assert.equal(cleanDraft(pouco, c), null);

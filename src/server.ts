@@ -1,46 +1,82 @@
 // Servidor local do Folga: sonda → classificador → HTTP/SSE (ADR 0001, R15–R17).
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readSync, rmSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { extname, join, normalize, sep } from 'node:path';
 import { decide, emptyAutoCare, finishRun } from './autocare.ts';
 import { classify, emptyHistory, type ClassifyHistory } from './classify.ts';
 import { startProbe } from './probe.ts';
-import { pushSample } from './samples.ts';
+import { pushSample, freshWindowMs } from './samples.ts';
 import { createReleaser } from './release.ts';
-import { openWindow, setStartup, startupInstalled } from './window.ts';
-import { createWarnings } from './warnings.ts';
+import { appBundlePath, openWindow, setStartup, startupAvailable, startupInstalled } from './window.ts';
+import { createWarnings, defaultCrashDir, readCrashEntries } from './warnings.ts';
 import { createFiles } from './files.ts';
+import { createAppData, parseAppDataBases } from './appdata.ts';
 import { createSuggestions } from './suggestions.ts';
 import { createWatch } from './watch.ts';
 import { createNotify } from './notify.ts';
 import { createAgent } from './agent.ts';
+import { accessText, dataDir, defaultSettings, macHelper, readPrivate, writePrivate } from './platform.ts';
 import { DEFAULT_SETTINGS, type AgentProvider, type Emit, type MemoryState, type ProbeSnapshot, type Sample, type Settings, type SuggestionDraft } from './types.ts';
 
 const ROOT = join(import.meta.dirname, '..');
 const PORT = Number(process.env.FOLGA_PORT ?? 4780);
-const DATA_DIR = process.env.FOLGA_DATA_DIR ?? join(process.env.LOCALAPPDATA ?? ROOT, 'Folga');
+const DATA_DIR = dataDir();
+const DEFAULTS = defaultSettings();
 const DIST = join(ROOT, 'dist');
+// Dentro do Folga.app (plano 3, ADR 0007): o app é o dono deste processo
+const IN_APP = process.platform === 'darwin' && process.env.FOLGA_APP === '1';
 const ALLOWED_HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
 
 mkdirSync(DATA_DIR, { recursive: true });
 
-/** Gravação atômica (ADR 0005): o leitor nunca vê o arquivo pela metade. */
-function writeAtomic(file: string, content: string) {
-  writeFileSync(file + '.tmp', content);
-  renameSync(file + '.tmp', file);
-}
+/** Gravação atômica (ADR 0005): o leitor nunca vê o arquivo pela metade. Privada (0600, sem seguir link). */
+const writeAtomic = writePrivate;
 
 // ---------- tokens (R16) ----------
 // ui-token: da interface, autoriza tudo. Arquivo com menos de 32 caracteres (vazio, cortado, editado à mão) é regerado.
+// Dentro do Folga.app (Mac) o ui-token NUNCA vai para o disco: arquivo da pasta de dados qualquer programa do usuário
+// lê, e com ele usaria as permissões de pasta do Folga (revisão de segurança). O app gera o token a cada início e o
+// entrega na 1ª linha do stdin; a janela o recebe num cookie e o menu o guarda na memória.
 const tokenFile = join(DATA_DIR, 'ui-token');
-let TOKEN = existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : '';
-if (TOKEN.length < 32) { TOKEN = randomBytes(32).toString('hex'); writeAtomic(tokenFile, TOKEN); }
-// agent-token: só do processo MCP do agente, novo a cada início, aceito apenas na varredura de arquivos (que só lê).
-// O ui-token também aprova sugestões; o agente nunca o vê.
-const AGENT_TOKEN = randomBytes(32).toString('hex');
-writeAtomic(join(DATA_DIR, 'agent-token'), AGENT_TOKEN);
+function tokenFromStdin(): string {
+  const buf = Buffer.alloc(128);
+  let s = '';
+  try {
+    while (!s.includes('\n') && s.length < 128) {
+      const n = readSync(0, buf, 0, 128 - s.length, null);
+      if (n <= 0) break;
+      s += buf.toString('utf8', 0, n);
+    }
+  } catch { /* sem stdin: token aleatório, a interface não abre (falha fechada) */ }
+  const t = (s.split('\n')[0] ?? '').trim();
+  return /^[0-9a-f]{64}$/.test(t) ? t : randomBytes(32).toString('hex');
+}
+let TOKEN: string;
+if (IN_APP) {
+  TOKEN = tokenFromStdin();
+  rmSync(tokenFile, { force: true });   // o de antes desta correção ainda estaria lá
+} else {
+  TOKEN = readPrivate(tokenFile);
+  if (TOKEN.length < 32) { TOKEN = randomBytes(32).toString('hex'); writeAtomic(tokenFile, TOKEN); }
+}
+// agent-token: só do processo MCP do agente. Existe só durante um turno do assistente (arquivo criado no início,
+// apagado e trocado no fim): fora disso, quem lê a pasta de dados não acha token nenhum.
+// Vale só nas leituras que o MCP faz e na varredura de arquivos. O ui-token também aprova sugestões; o agente nunca o vê.
+const agentTokenFile = join(DATA_DIR, 'agent-token');
+let AGENT_TOKEN = randomBytes(32).toString('hex');
+rmSync(agentTokenFile, { force: true });
+// close só mexe se o token ainda é o daquele turno: um turno velho (conversa zerada no meio) não apaga o do novo
+const agentTurn = {
+  open() { AGENT_TOKEN = randomBytes(32).toString('hex'); writeAtomic(agentTokenFile, AGENT_TOKEN); return AGENT_TOKEN; },
+  close(t: string | void) { if (t !== AGENT_TOKEN) return; rmSync(agentTokenFile, { force: true }); AGENT_TOKEN = randomBytes(32).toString('hex'); },
+};
+// o que o MCP (src/mcp.ts) lê; dentro do app toda leitura pede token
+const AGENT_GETS = new Set(['/api/state', '/api/warnings', '/api/disk', '/api/quickclean', '/api/appdata', '/api/startup-apps', '/api/suggestions', '/api/log']);
+const cookieToken = (req: IncomingMessage) =>
+  (req.headers.cookie ?? '').split(';').map(c => c.trim()).find(c => c.startsWith('folga_t='))?.slice('folga_t='.length) ?? '';
 
 // ---------- ajustes (ADR 0005: gravação atômica) ----------
 const settingsFile = join(DATA_DIR, 'settings.json');
@@ -51,7 +87,8 @@ function loadSettings(): Settings {
   try {
     // tira o BOM: editor ou PowerShell 5.1 gravando o arquivo o coloca, e aí o JSON.parse falha e os
     // ajustes do usuário somem em silêncio (visto num teste nosso em 2026-10-18)
-    const r = mergeSettings(DEFAULT_SETTINGS, JSON.parse(readFileSync(settingsFile, 'utf8').replace(/^﻿/, '')));
+    // arquivo sem o campo é de antes do Mac: percentual, sem migração (spec)
+    const r = mergeSettings({ ...DEFAULTS, autoCareTrigger: 'percent' }, JSON.parse(readFileSync(settingsFile, 'utf8').replace(/^﻿/, '')));
     if (typeof r === 'string') throw new Error(r);
     settingsFrom = 'settings.json';
     settingsProblem = null;
@@ -61,7 +98,7 @@ function loadSettings(): Settings {
       settingsProblem = e instanceof Error ? e.message : 'o arquivo não pôde ser lido';
       settingsFrom = `padrões (settings.json recusado: ${settingsProblem})`;
     }
-    return { ...DEFAULT_SETTINGS };
+    return { ...DEFAULTS };
   }
 }
 function saveSettings(s: Settings) { writeAtomic(settingsFile, JSON.stringify(s, null, 2)); }
@@ -72,6 +109,7 @@ const RANGES: Partial<Record<keyof Settings, [number, number]>> = {
 };
 const ENUMS: Partial<Record<keyof Settings, readonly string[]>> = {
   warningsLevel: ['todos', 'criticos'], agentProvider: ['claude', 'gpt'],
+  autoCareTrigger: ['percent', 'pressure'], autoCarePressure: ['warn', 'critical'],
 };
 const BOOLS: readonly (keyof Settings)[] = ['autoCareEnabled', 'watchEnabled'];
 /** Valida um PUT parcial; devolve o ajuste completo ou uma mensagem de erro. */
@@ -107,6 +145,7 @@ let history: ClassifyHistory = emptyHistory();
 let lastSnap: ProbeSnapshot | null = null;
 let samples: Sample[] = [];
 let state: MemoryState | null = null;
+let lastFreshAt = 0;   // hora da última leitura NOVA da sonda (releitura re-carimba state.t, isto não)
 const extraSelfPids = new Set<number>();   // janela do Edge (F-08)
 const sse = new Set<ServerResponse>();
 const snapshotListeners: ((s: MemoryState) => void)[] = [];
@@ -121,6 +160,8 @@ function selfPids(snap: ProbeSnapshot): number[] {
   const out = new Set<number>();
   const walk = (pid: number) => { if (out.has(pid)) return; out.add(pid); for (const c of children.get(pid) ?? []) walk(c); };
   for (const r of roots) walk(r);
+  // o app e os processos do WebKit dele, que a sonda já agrupa pelo .app responsável
+  if (IN_APP) for (const p of snap.processes) if (p.name.toLowerCase() === 'local.folga.mac') out.add(p.pid);
   return [...out];
 }
 
@@ -136,6 +177,7 @@ function runAutoCare(keys: string[]) {
 /** fresh = leitura nova da sonda; releituras do mesmo snapshot (ajuste, liberação) não contam para o Auto Care. */
 function onSnapshot(snap: ProbeSnapshot, fresh = false) {
   lastSnap = snap;
+  if (fresh) lastFreshAt = Date.now();
   const userSession = snap.processes.find(p => p.pid === process.pid)?.session ?? 1;
   const now = Date.now();
   const r = classify(snap, history, settings, { selfPids: selfPids(snap), userSession, startedAt, now });
@@ -145,6 +187,7 @@ function onSnapshot(snap: ProbeSnapshot, fresh = false) {
     t: now, memLoad: snap.memLoad, totalPhys: snap.totalPhys, availPhys: snap.availPhys,
     apps: r.apps, freed: releaser.freed(), settings, startedAt,
     autoCare: { nextEligibleAt: null, lastRunAt: null }, samples,
+    memPressure: snap.memPressure, swapUsed: snap.swapUsed,
   };
   if (fresh) {
     const d = decide({ ...ac, running: ac.running || releaser.isBusy() }, state, settings, now);
@@ -162,6 +205,7 @@ const probeArgs = (): [string, string[]] => {
   const fake = process.env.FOLGA_FAKE_PROBE;   // testes: script node que imita a sonda
   const interval = String(Math.round(Number(settings.sampleSeconds)) || 2);   // vai no -Command do PowerShell: só número
   if (fake) return [process.execPath, [fake, '--interval', interval]];
+  if (process.platform === 'darwin') return [join(ROOT, 'probe', 'bin', 'probe-mac'), ['--interval', interval]];
   // .exe compilado: só com FOLGA_PROBE_EXE=1, porque o antivírus apaga exe sem assinatura (ADR 0002)
   if (process.env.FOLGA_PROBE_EXE === '1') return [join(ROOT, 'probe', 'bin', 'probe.exe'), ['--interval', interval]];
   // Padrão: o mesmo probe.cs compilado em memória pelo Add-Type do PowerShell 5.1 (~32 MB)
@@ -194,14 +238,28 @@ const emit: Emit = (event, data) => {
 const warnings = createWarnings({
   getState: () => state, getSettings: () => settings, probeAlive: () => probeUp,
   lastAutoCareRun: () => ac.lastRunAt, emit, settingsProblem: () => settingsProblem,
+  notify: (title, body) => notify.toast(title, body),   // só críticos chegam aqui; texto pelo caminho de sempre (R31)
 });
-const files = createFiles({ getSettings: () => settings, roots: process.env.FOLGA_FILES_ROOTS?.split(';') });   // testes: pastas no lugar das do usuário
+/** Apps abertos, para apagar cache: só com sonda viva e leitura nova (3 intervalos, mín. 10 s). Senão null = tratar tudo como aberto. */
+const runningKeys = () => (state && probeUp && Date.now() - lastFreshAt <= freshWindowMs(settings.sampleSeconds)
+  ? new Set(state.apps.map(a => a.key)) : null);
+const files = createFiles({
+  getSettings: () => settings, roots: process.env.FOLGA_FILES_ROOTS?.split(';'),   // testes: pastas no lugar das do usuário
+  runningKeys,                                                                      // Mac: navegador aberto pela sonda
+});
+// FOLGA_APPDATA_BASES (testes e verificação ao vivo): JSON { "appSupport": "/tmp/…", … }. Ele SUBSTITUI as bases
+// padrão (não mescla): a base que o teste não listar não é lida. Torto (JSON quebrado, null, lista, base desconhecida,
+// caminho relativo) → não sobe: nunca cai nas pastas reais nem em '/'.
+const appData = createAppData({
+  runningKeys,
+  bases: process.env.FOLGA_APPDATA_BASES ? parseAppDataBases(process.env.FOLGA_APPDATA_BASES) : undefined,
+});
 const suggestions = createSuggestions({
-  dataDir: DATA_DIR, files, getState: () => state, emit,
+  dataDir: DATA_DIR, files, getState: () => state, emit, appData,
   release: async keys => { const r = await releaser.release(keys, 'manual'); if (lastSnap) onSnapshot(lastSnap); return r; },
 });
 const agent = createAgent({
-  dataDir: DATA_DIR, port: PORT, emit, selfPids: extraSelfPids,
+  dataDir: DATA_DIR, port: PORT, emit, selfPids: extraSelfPids, turnOpen: agentTurn.open, turnClose: agentTurn.close,
   addSuggestion: draft => suggestions.add(draft, 'agente'),
 });
 // R30: o vigia propõe sozinho; quem executa continua sendo o clique do usuário em suggestions.approve
@@ -276,6 +334,16 @@ const server = createServer(async (req, res) => {
     // outro site disparando a requisição (ex.: uma imagem de outro site apontando para uma GET cara): o navegador avisa em Sec-Fetch-Site
     if (req.headers['sec-fetch-site'] === 'cross-site') return send(res, 403, { erro: 'origem não permitida' });
 
+    // Dentro do app toda a /api/ pede token, leitura inclusive (lista de arquivos, conversa, sugestões): cookie da
+    // janela, cabeçalho do menu, ou o agent-token nas leituras do MCP. Fora do app (Windows, npm run app) fica como era.
+    if (IN_APP) {
+      const given = req.headers['x-folga-token'];
+      const agentRead = method === 'GET' && AGENT_GETS.has(path) && given === AGENT_TOKEN;
+      if (given !== TOKEN && cookieToken(req) !== TOKEN && !agentRead && !(method === 'POST' && path === '/api/files/scan' && given === AGENT_TOKEN)) {
+        return send(res, 403, { erro: 'token inválido' });
+      }
+    }
+
     // R16: escrita só com JSON e token. O agent-token vale só na varredura de arquivos.
     if (method === 'POST' || method === 'PUT') {
       if (!(req.headers['content-type'] ?? '').startsWith('application/json')) return send(res, 415, { erro: 'use application/json' });
@@ -298,6 +366,10 @@ const server = createServer(async (req, res) => {
     if (method === 'PUT' && path === '/api/settings') {
       const merged = mergeSettings(settings, await readJson(req));
       if (typeof merged === 'string') return send(res, 400, { erro: merged });
+      // a sonda do Windows não lê pressão de memória: o Auto Care por pressão nunca dispararia
+      if (process.platform === 'win32' && merged.autoCareTrigger === 'pressure') {
+        return send(res, 400, { erro: 'Auto Care por pressão de memória só existe no Mac; no Windows use o percentual' });
+      }
       settings = merged;
       saveSettings(settings);
       // R34: acabamos de gravar um arquivo válido, então o aviso "seus ajustes não foram lidos" perdeu a
@@ -311,23 +383,28 @@ const server = createServer(async (req, res) => {
       return send(res, 200, settings);
     }
     if (method === 'POST' && path === '/api/release') {
-      const body = await readJson(req) as { keys?: unknown };
+      const body = await readJson(req) as { keys?: unknown; onlyIdle?: unknown };
       const keys = body?.keys;
       if (!Array.isArray(keys) || keys.length === 0 || keys.length > 100 || !keys.every(k => typeof k === 'string')) {
         return send(res, 400, { erro: 'keys deve ser uma lista de apps' });
       }
-      const r = await releaser.release(keys as string[], 'manual');
+      const r = await releaser.release(keys as string[], 'manual', body.onlyIdle === true);
       if ('erro' in r) return send(res, r.status, { erro: r.erro });
       if (lastSnap) onSnapshot(lastSnap);
       return send(res, 200, r);
     }
     if (method === 'POST' && path === '/api/window') {
+      // no Mac a janela é a do Folga.app (WebKit, ADR 0007); o servidor não procura navegador
+      if (process.platform === 'darwin') return send(res, 409, { erro: 'abra pelo app Folga na barra de menus' });
       return showWindow() ? send(res, 200, { ok: true }) : send(res, 500, { erro: 'Edge não encontrado' });
     }
-    if (method === 'GET' && path === '/api/startup') return send(res, 200, { on: startupInstalled() });
+    if (method === 'GET' && path === '/api/startup') return send(res, 200, { on: startupInstalled(), available: startupAvailable() });
     if (method === 'PUT' && path === '/api/startup') {
       const body = await readJson(req) as { on?: unknown };
       if (typeof body?.on !== 'boolean') return send(res, 400, { erro: 'on deve ser verdadeiro ou falso' });
+      // ligar só onde existe: no Mac, dentro do app e com o caminho do .app válido; desligar é sempre permitido
+      if (body.on && !startupAvailable()) return send(res, 409, { erro: 'disponível pelo app Folga' });
+      if (body.on && process.platform === 'darwin' && !appBundlePath()) return send(res, 409, { erro: 'caminho do Folga.app inválido' });
       return send(res, 200, { on: await setStartup(body.on, ROOT) });
     }
     if (method === 'GET' && path === '/api/log') {
@@ -348,6 +425,7 @@ const server = createServer(async (req, res) => {
       return send(res, 200, await files.scan({ olderThanDays: num(body.olderThanDays, 7, 3650), minMB: num(body.minMB, 1, 100_000) }));
     }
     if (method === 'GET' && path === '/api/quickclean') return send(res, 200, await files.quickCleanPreview());
+    if (method === 'GET' && path === '/api/appdata') return send(res, 200, await appData.preview());
     if (method === 'GET' && path === '/api/suggestions') return send(res, 200, suggestions.list());
     if (method === 'POST' && path === '/api/suggestions') {
       const r = await suggestions.add(await readJson(req) as SuggestionDraft, 'folga');
@@ -399,7 +477,23 @@ server.listen(PORT, '127.0.0.1', () => {
   // uma linha por início: no logon é a única testemunha do que o servidor leu (R32)
   console.log(`[${new Date().toISOString()}] Folga em http://127.0.0.1:${PORT} | dados em ${DATA_DIR} | ajustes de ${settingsFrom} | Auto Care ${settings.autoCareEnabled ? `em ${settings.autoCareThreshold} %` : 'desligado'}`);
   if (process.env.FOLGA_OPEN_WINDOW === '1') showWindow();
+  if (IN_APP) void accessLine().then(l => console.log(`[${new Date().toISOString()}] ${l}`));
+  // R32: o que o app lê de dentro (a pasta de relatórios é protegida? o código do erro, se for)
+  if (IN_APP) void readCrashEntries(defaultCrashDir(), Date.now())
+    .then(r => `travamentos: ${r.length} relatórios lidos`, (e: NodeJS.ErrnoException) => e.code === 'ENOENT' ? 'travamentos: pasta não existe' : `travamentos: sem acesso (${e.code ?? 'erro'})`)
+    .then(l => console.log(`[${new Date().toISOString()}] ${l}`));
 });
+
+/** R32, dentro do app: quem o macOS cobra e quem lê a Lixeira (decisão 17: nenhum dos dois deveria). "assistente SIM" é bug. */
+async function accessLine(): Promise<string> {
+  const probe = join(ROOT, 'probe', 'bin', 'probe-mac');
+  const trash = join(homedir(), '.Trash');
+  const resp = await macHelper(['--responsible'], null, 5_000) as { path?: unknown } | null;
+  const le = (r: unknown) => { const d = (r as { denied?: unknown } | null)?.denied; return d === false ? 'sim' : d === true ? 'não' : '?'; };
+  const servidor = le(await macHelper(['--size'], trash, 20_000));
+  const assistente = le(await macHelper(['--disclaim', probe, '--size'], trash, 20_000));
+  return accessText(typeof resp?.path === 'string' && resp.path ? resp.path : '?', servidor, assistente);
+}
 
 const shutdown = () => {
   warnings.stop();
@@ -411,3 +505,5 @@ const shutdown = () => {
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+// o app segura o outro lado do stdin; caiu (até por kill -9) → o pipe fecha → sem servidor órfão na porta
+if (IN_APP) process.stdin.on('end', shutdown).resume();

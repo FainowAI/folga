@@ -1,5 +1,5 @@
 // Formatos compartilhados pelas telas (pt-BR, espaço não separável entre número e unidade).
-import type { Outcome } from '../../src/types';
+import type { MemPressure, Outcome, Settings } from '../../src/types';
 
 export const MB = 1024 ** 2;
 export const GB = 1024 ** 3;
@@ -13,6 +13,11 @@ export const size = (b: number) =>
   b >= GB ? `${nf1.format(b / GB)}${NB}GB` : `${nf0.format(Math.max(0, b) / MB)}${NB}MB`;
 export const pct = (n: number) => `${Math.round(n)}${NB}%`;
 export const plural = (n: number, one: string, many: string) => `${nf0.format(n)} ${n === 1 ? one : many}`;
+
+export const pressureName: Record<MemPressure, string> = { normal: 'verde', warn: 'amarela', critical: 'vermelha' };
+/** quando o Auto Care começa: "em 92 %" ou, no Mac, "na pressão amarela" */
+export const autoCareAt = (s: Settings) =>
+  s.autoCareTrigger === 'pressure' ? `na pressão ${pressureName[s.autoCarePressure]}` : `em ${pct(s.autoCareThreshold)}`;
 
 /** "menos de 1 min", "40 min", "2 h", "3 d" */
 export function ago(ms: number) {

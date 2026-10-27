@@ -1,8 +1,8 @@
 // Arquivos que o usuário não abre mais (D16) e Limpeza rápida (D17). Nada é feito daqui: os botões só PREPARAM uma
 // sugestão, que o usuário aprova no cartão (dois passos, R20).
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { MemoryState, QuickCleanItem, StaleFile, StaleScan, Suggestion } from '../../src/types';
-import { addSuggestion, getQuickClean, getStale, getSuggestions, onEvent, scanStale } from './api';
+import type { AppDataScan, MemoryState, QuickCleanItem, StaleFile, StaleScan, Suggestion } from '../../src/types';
+import { addSuggestion, getAppData, getQuickClean, getStale, getSuggestions, onEvent, scanStale } from './api';
 import { MB, NB, nf1, plural } from './format';
 import { SuggestionCard, sizeFine } from './SuggestionCard';
 import './styles/arquivos.css';
@@ -20,11 +20,16 @@ function agoLong(ms: number) {
   if (d >= 1) return `há ${plural(d, 'dia', 'dias')}`;
   return 'hoje';
 }
-const folderOf = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf('\\')));
+const folderOf = (p: string) => p.slice(0, Math.max(0, p.search(/[\\/][^\\/]*$/)));
+// Mesma regra do pathKey do servidor (src/files.ts), repetida porque a interface não importa módulos do Node:
+// no Mac o APFS não distingue caixa nem NFC/NFD; no Windows só a caixa.
+const pathKey = (p: string, mac: boolean) => (mac ? p.normalize('NFC') : p).toLowerCase();
 const BASIS: Record<StaleFile['basis'], string> = {
   acesso: 'último acesso registrado pelo Windows',
   recentes: 'atalho na pasta Recentes do Windows',
   modificacao: 'data de modificação',
+  spotlight: 'último uso registrado pelo Spotlight',
+  adicionado: 'data em que chegou ao Mac',
 };
 
 type SortKey = 'name' | 'folder' | 'size' | 'lastUsed';
@@ -45,10 +50,13 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
   const [scanError, setScanError] = useState('');
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'size', dir: -1 });
-  const [preparing, setPreparing] = useState<'lixeira' | 'limpeza' | null>(null);
+  const [preparing, setPreparing] = useState<'lixeira' | 'limpeza' | 'dados' | null>(null);
   const [prepError, setPrepError] = useState('');
   const [clean, setClean] = useState<QuickCleanItem[] | null>(null);
   const [cleanError, setCleanError] = useState(false);
+  const [apps, setApps] = useState<AppDataScan | null>(null);
+  const [appsError, setAppsError] = useState(false);
+  const [appSel, setAppSel] = useState<Set<string>>(new Set());
   const [sugs, setSugs] = useState<Suggestion[]>([]);
   const [created, setCreated] = useState<string | null>(null);   // cartão que acabei de preparar
   const reviewRef = useRef<HTMLElement>(null);
@@ -78,6 +86,14 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
   };
   useEffect(loadClean, []);
 
+  // dados dos apps (Mac e Windows: medição das pastas de dados dos apps, que demora alguns segundos)
+  const mac = state?.memPressure !== undefined;
+  const loadApps = () => {
+    setAppsError(false);
+    getAppData().then(setApps).catch(() => { setApps(null); setAppsError(true); });
+  };
+  useEffect(loadApps, []);
+
   // sugestões, inclusive as do assistente
   useEffect(() => {
     let live = true;
@@ -89,7 +105,10 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
   // depois de uma limpeza aprovada, os números do cartão mudam
   const doneClean = sugs.filter(s => s.kind === 'limpeza_rapida' && s.status === 'feita').length;
   const firstClean = useRef(true);
+  const doneApps = sugs.filter(s => s.kind === 'dados_apps' && s.status === 'feita').length;
+  const firstApps = useRef(true);
   useEffect(() => { if (firstClean.current) { firstClean.current = false; return; } loadClean(); }, [doneClean]);
+  useEffect(() => { if (firstApps.current) { firstApps.current = false; return; } setAppSel(new Set()); loadApps(); }, [doneApps]);
 
   async function search() {
     setScanning(true); setScanError(''); setSel(new Set());
@@ -106,10 +125,10 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
   // arquivos que entraram numa sugestão de Lixeira já aprovada: ficam apagados da seleção e marcados
   const handled = useMemo(() => {
     const set = new Set<string>();
-    for (const s of sugs) if (s.kind === 'lixeira' && s.status === 'feita') for (const i of s.items) set.add(i.id.toLowerCase());
+    for (const s of sugs) if (s.kind === 'lixeira' && s.status === 'feita') for (const i of s.items) set.add(pathKey(i.id, mac));
     return set;
-  }, [sugs]);
-  const isHandled = (f: StaleFile) => handled.has(f.path.toLowerCase());
+  }, [sugs, mac]);
+  const isHandled = (f: StaleFile) => handled.has(pathKey(f.path, mac));
 
   const selectable = rows.filter(f => !isHandled(f));
   const chosen = rows.filter(f => sel.has(f.path) && !isHandled(f));
@@ -122,7 +141,12 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
   const toggleAll = () => setSel(allOn ? new Set() : new Set(selectable.map(f => f.path)));
   const sortBy = (key: SortKey) => setSort(s => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === 'name' || key === 'folder' ? 1 : -1 }));
 
-  async function prepare(kind: 'lixeira' | 'limpeza') {
+  const appItems = (apps?.entries ?? []).flatMap(e => e.items);
+  const chosenApp = appItems.filter(i => appSel.has(i.id) && i.actionable && i.bytes > 0);
+  const chosenAppBytes = chosenApp.reduce((n, i) => n + i.bytes, 0);
+  const toggleApp = (id: string) => setAppSel(prev => { const n = new Set(prev); if (!n.delete(id)) n.add(id); return n; });
+
+  async function prepare(kind: 'lixeira' | 'limpeza' | 'dados') {
     setPreparing(kind); setPrepError('');
     try {
       const s = kind === 'lixeira'
@@ -130,6 +154,11 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
             kind: 'lixeira', items: chosen.map(f => f.path),
             title: `Mandar ${plural(chosen.length, 'arquivo parado', 'arquivos parados')} para a Lixeira`,
             reason: `Não são abertos há mais de ${dayLabel(scan?.olderThanDays ?? days)}; ficam ${sizeFine(chosenBytes)} livres. Dá para restaurar pela Lixeira.`,
+          })
+        : kind === 'dados'
+        ? await addSuggestion({
+            kind: 'dados_apps', items: chosenApp.map(i => i.id), title: 'Limpar cache de apps fechados',
+            reason: 'Os apps recriam esses dados sozinhos. Conversas, logins e configurações ficam.',
           })
         : await addSuggestion({
             kind: 'limpeza_rapida', items: [], title: 'Limpeza rápida',
@@ -145,7 +174,7 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
   const createdSug = created ? sugs.find(s => s.id === created) : undefined;
   const pending = sugs.filter(s => s.status === 'pendente' && s.id !== created);
   const tracking = scan ? scan.accessTracking : true;
-  const sub = tracking ? 'Pelo último acesso registrado pelo Windows' : 'Pela data de modificação (o Windows não registra o acesso neste PC)';
+  const sub = mac ? 'Pelo último uso que o Mac registra' : tracking ? 'Pelo último acesso registrado pelo Windows' : 'Pela data de modificação (o Windows não registra o acesso neste PC)';
   const cleanable = clean?.some(i => i.actionable && i.bytes > 0) ?? false;
   const th = (key: SortKey, label: string, cls = '') => (
     <th scope="col" className={cls} aria-sort={sort.key === key ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}>
@@ -179,7 +208,7 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
               {scanning ? 'procurando…' : 'Procurar'}
             </button>
             <p className="arq-result" role="status">
-              {scanning ? 'Olhando Downloads, Área de Trabalho, Documentos, Imagens, Vídeos e Músicas…'
+              {scanning ? (mac ? 'Olhando Downloads, Mesa, Documentos, Imagens, Filmes, Música…' : 'Olhando Downloads, Área de Trabalho, Documentos, Imagens, Vídeos e Músicas…')
                 : scan ? `${plural(scan.files.length, 'arquivo', 'arquivos')}${scan.files.length >= 500 ? ' (os 500 maiores)' : ''} · ${sizeFine(scan.totalBytes)} · em ${nf1.format(scan.durationMs / 1000)}${NB}s${scan.truncated ? ' · parou no limite, pode haver mais' : ''}`
                 : ''}
             </p>
@@ -226,6 +255,7 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
                         </td>
                         <th scope="row" className="arq-name" title={f.name}>
                           <span>{f.name}</span>
+                          {f.isApp && <span className="arq-tag">app</span>}
                           {done && <span className="arq-tag">enviado</span>}
                         </th>
                         <td className="arq-folder" title={folderOf(f.path)}>{folderOf(f.path)}</td>
@@ -240,6 +270,47 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
           )}
         </section>
 
+        <section className="arq-clean" aria-labelledby={`${uid}-da`}>
+          <h2 className="arq-h" id={`${uid}-da`}>Dados dos apps</h2>
+          <div className="arq-card">
+            {apps === null && !appsError && <p className="arq-empty" role="status">Medindo os dados dos apps…</p>}
+            {appsError && <p className="arq-empty">Não deu para medir agora. <button type="button" className="arq-link" onClick={loadApps}>Tentar de novo</button></p>}
+            {apps && apps.entries.length === 0 && <p className="arq-empty">Nenhum app com dados grandes.</p>}
+            {apps?.entries.map(e => (
+              <div key={e.id} className="arq-app">
+                <p className="arq-app-head"><strong>{e.name}</strong><span className="arq-cat-size">{sizeFine(e.bytes)}</span></p>
+                <p className="arq-cat-note" title={e.where}>{e.where}</p>
+                <ul className="arq-cats">
+                  {e.items.map(i => (
+                    <li key={i.id} data-info={!i.actionable || undefined}>
+                      <span className="arq-cat-name">
+                        {i.actionable && <input type="checkbox" className="arq-app-chk" checked={appSel.has(i.id)} disabled={i.bytes === 0} onChange={() => toggleApp(i.id)} aria-label={`Selecionar ${i.label}`} />}
+                        {i.label}
+                      </span>
+                      <span className="arq-cat-size">{sizeFine(i.bytes)}</span>
+                      <span className="arq-cat-note">{plural(i.files, 'arquivo', 'arquivos')}{i.note ? ` · ${i.note}` : ''}</span>
+                    </li>
+                  ))}
+                  {e.notes.map(n => (
+                    <li key={n.text} data-info>
+                      <span className="arq-cat-name">{n.text}</span>
+                      <span className="arq-cat-size">{sizeFine(n.bytes)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+            {apps?.truncated && <p className="arq-fine">Medição parcial: parou no limite, pode haver mais.</p>}
+            <p className="arq-fine">
+              {chosenApp.length === 0 ? 'Nenhum cache selecionado.' : `${plural(chosenApp.length, 'cache selecionado', 'caches selecionados')} · ${sizeFine(chosenAppBytes)}.`}
+              {' '}Só apps fechados. Conversas, logins e configurações ficam. Apaga de vez, não vai para a Lixeira.
+            </p>
+            <button type="button" className="pill" onClick={() => prepare('dados')} disabled={chosenApp.length === 0 || preparing !== null} aria-busy={preparing === 'dados'}>
+              {preparing === 'dados' ? 'preparando…' : 'Preparar limpeza'}
+            </button>
+          </div>
+        </section>
+
         <section className="arq-clean" aria-labelledby={`${uid}-lr`}>
           <h2 className="arq-h" id={`${uid}-lr`}>Limpeza rápida</h2>
           <div className="arq-card">
@@ -250,10 +321,10 @@ export function Arquivos({ state }: { state: MemoryState | null }) {
                 {clean.map(i => (
                   <li key={i.category} data-info={!i.actionable || undefined}>
                     <span className="arq-cat-name">{i.label}</span>
-                    <span className="arq-cat-size">{sizeFine(i.bytes)}</span>
+                    <span className="arq-cat-size">{i.unknown ? '—' : sizeFine(i.bytes)}</span>
                     <span className="arq-cat-note">
-                      {plural(i.files, 'arquivo', 'arquivos')}
-                      {i.note ? ` · ${i.note}` : ''}
+                      {i.unknown ? '' : plural(i.files, 'arquivo', 'arquivos')}
+                      {i.note ? `${i.unknown ? '' : ' · '}${i.note}` : ''}
                     </span>
                   </li>
                 ))}

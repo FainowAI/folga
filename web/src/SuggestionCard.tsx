@@ -17,6 +17,7 @@ export const sizeFine = (b: number) =>
 const WHAT: Record<Suggestion['kind'], { noun: [string, string]; promise: string }> = {
   lixeira: { noun: ['arquivo', 'arquivos'], promise: 'Vai para a Lixeira: dá para restaurar.' },
   limpeza_rapida: { noun: ['categoria', 'categorias'], promise: 'Apaga de vez: não vai para a Lixeira.' },
+  dados_apps: { noun: ['cache', 'caches'], promise: 'Apaga de vez: o app recria sozinho.' },
   liberar_memoria: { noun: ['app', 'apps'], promise: 'Fecha do jeito normal; um app pode pedir para salvar.' },
 };
 const STATUS: Record<Exclude<Suggestion['status'], 'pendente'>, { text: string; tone: string }> = {
@@ -41,7 +42,7 @@ export function SuggestionCard({ s, compact = false }: { s: Suggestion; compact?
     catch (e) { setError(e instanceof Error ? e.message : 'não deu certo'); }
     finally { setBusy(null); setConfirm(false); }
   }
-  const approve = () => (cur.kind === 'limpeza_rapida' && !confirm ? setConfirm(true) : decide('aprovar'));
+  const approve = () => ((cur.kind === 'limpeza_rapida' || cur.kind === 'dados_apps') && !confirm ? setConfirm(true) : decide('aprovar'));
 
   return (
     <article className="sug-card" data-compact={compact || undefined} data-status={cur.status} aria-labelledby={titleId}>

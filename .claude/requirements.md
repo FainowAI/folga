@@ -5,10 +5,14 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
 ## Memória
 - **R01 Memória usada** — A porcentagem, o total e o disponível vêm de `GlobalMemoryStatusEx`
   (`dwMemoryLoad`, `ullTotalPhys`, `ullAvailPhys`), os mesmos números do Gerenciador de Tarefas.
+  - **No Mac** (emenda): `usada = app + wired + comprimida`, `disponível = total − usada` (conta do Monitor de Atividade), com
+    pressão de memória e swap ao lado; não existe `dwMemoryLoad`.
 - **R02 Tamanho do app** — Os processos são agrupados pelo nome do executável, sem diferenciar
   maiúsculas. O tamanho do grupo é a **soma do working set privado** de cada processo, não `WorkingSet64`,
   que conta páginas compartilhadas e infla a soma. Nome de exibição: `FileDescription` do executável,
   ou o nome do arquivo se não houver.
+  - **No Mac** (emenda): o grupo é o bundle (`.app`), chave = bundle id, nome = `localizedName`; `Google Chrome Helper` soma no
+    Chrome. O tamanho é `ri_phys_footprint`, o número do Monitor de Atividade.
 - **R03 Parado** — Um app fica parado quando nenhuma janela dele está em primeiro plano há `idleMinutes`
   (padrão 30, ajustável) **e** ele não está ocupado (R04). A contagem começa quando o app sobe:
   **na primeira execução nada vem marcado** até passar `idleMinutes`.
@@ -27,6 +31,9 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
   - a lista **"nunca fechar"** do usuário. O padrão traz terminais, editores e apps de agente, porque fechar
     um deles mata agentes e servidores rodando dentro: `WindowsTerminal`, `cmd`, `powershell`, `pwsh`, `Code`,
     `Cursor`, `Claude` (Claude Code), `Antigravity IDE`, `Codex`.
+  - **No Mac** (emenda): protegidos são `launchd`, `loginwindow`, `Dock`, `WindowServer`, `Finder`, `SystemUIServer` e afins; app
+    de barra de menus ou agente conta como bandeja (P03). A lista "nunca fechar" padrão vai por bundle id (Terminal, iTerm2,
+    Ghostty, Warp, Code, Cursor, Claude, Codex, Xcode). App do Dock sem janela e parado pode ser liberado (decisão 8).
 - **R06 Grupos** — Na tela: Parados (marcados), Em uso (primeiro plano agora, ocupado ou usado há menos
   de `idleMinutes`), Sistema e protegidos (total, contagem e a lista que a R36 descreve), Liberados
   (fechados nesta sessão).
@@ -72,18 +79,25 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
   - `ficou aberto`: a janela segue visível, provavelmente pedindo para salvar. Não insiste.
   - `foi para a bandeja`: o processo segue vivo sem janela visível. Só encerra de vez se o app estiver na
     lista "pode encerrar de vez" que o usuário marcou (P03).
+  - **No Mac** (emenda): liberar é `terminate()` (Cmd+Q), nunca `forceTerminate` por padrão (decisão 4). `fechou` = o processo
+    saiu no prazo; `ficou aberto` = o app recusou ou perguntou sobre salvar; `bandeja` deixa de ser o caso comum.
 - **R08 Quanto voltou** — "Liberados X GB" = `ullAvailPhys` depois − antes, medido 5 s depois do último
   fechamento. Nunca a soma do tamanho dos apps.
+  - **No Mac** (emenda): "quanto voltou" é o disponível da conta do Mac (R02), medido depois do mesmo intervalo.
 - **R09 Só o que foi marcado** — A liberação fecha só os grupos enviados no pedido, e só se eles ainda
   forem candidatos (R05) no momento do fechamento. Um pedido com app protegido é recusado inteiro.
 
 ## Auto Care de memória
 - **R10 Gatilho** — Ligado em Ajustes. Dispara quando `dwMemoryLoad ≥ autoCareThreshold` (padrão 92 %)
   em **duas leituras seguidas**.
+  - **No Mac** (emenda): o gatilho padrão é a pressão de memória (`autoCareTrigger: 'pressure'`, `warn` ou `critical`), não os 92 %;
+    o percentual continua valendo no modo `percent`. Arquivo de ajustes antigo, sem o campo, é `percent`.
 - **R11 O que fecha** — Só os apps parados (R03), nunca os ocupados nem os protegidos. Usa o mesmo
   caminho da liberação manual (R07, R08).
 - **R12 Freio** — Depois de rodar, espera `autoCareCooldownMinutes` (padrão 10) antes de poder rodar de novo.
 - **R13 Vida** — Roda enquanto o servidor do app estiver vivo, com ou sem a janela aberta.
+  - **No Mac** (emenda, plano 3): o Auto Care roda enquanto o servidor estiver vivo; o `Folga.app` o sobe e supervisiona, com a
+    janela aberta ou só o ícone na barra.
 
 ## Registro
 - **R14** — Toda liberação grava uma linha em `log.jsonl`: data, origem (`manual`/`auto`), memória antes e
@@ -99,6 +113,7 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
   ele nunca serve para aprovar, liberar ou mudar ajustes.
 - **R16c** — Toda resposta leva `X-Frame-Options: DENY`, CSP com `frame-ancestors 'none'` e `nosniff`.
   Requisição a `/api/*` com `Sec-Fetch-Site: cross-site` recebe 403.
+  - **No Mac** (emenda): o token fica em `~/Library/Application Support/Folga/ui-token` (0600), não em `%LOCALAPPDATA%`.
 - **R17** — Mensagens de erro para a interface não trazem caminho, pilha nem detalhe interno. Isso vale
   também para o chat do assistente: o detalhe do CLI vai só para o console.
 
@@ -113,6 +128,8 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
   - o tamanho vem do `stat`, nunca do modelo.
 
   App a liberar tem que ser candidato agora (R09). Um item inválido recusa a sugestão inteira.
+  - **No Mac** (emenda): o validador é a versão POSIX (absoluto, `realpath` dentro de raiz permitida, sem `..`, sem link saindo
+    da raiz); as raízes são Downloads, Desktop, Documents, Pictures, Movies e Music. Vai para a Lixeira por `trashItem` ("Pôr de volta").
 - **R22 Nada do usuário é apagado de vez** — Arquivo do usuário vai para a Lixeira. Só temporários e
   caches que se refazem (D17) são apagados de vez, e só com aprovação.
 - **R23 O cartão mostra o que vai acontecer** — A lista real de itens, com tamanho e caminho, e não a
@@ -121,6 +138,10 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
   produzir uma ação fora das pastas permitidas. Há um teste com esse caso.
 - **R25 Um turno por vez** — Teto de 120 s por turno; ao estourar, o servidor mata a árvore do processo do
   agente. O processo termina ao fim de cada turno.
+  - **No Mac** o assistente só roda com estas travas: CLI de uma lista fechada de lugares (nunca `PATH` nem `cwd`),
+    Mach-O, do usuário, sem escrita de grupo/outros no arquivo nem na pasta, com nome real `claude`/`claude.exe`/`codex`;
+    ambiente montado do zero (sem `NODE_*`, `DYLD_*` nem chave de API); Codex em sandbox `read-only`, sem web e com os
+    recursos que agem desligados; o CLI roda em grupo de processos próprio e parar/estourar o tempo mata o grupo inteiro.
 
 - **R29 Navegador com várias janelas** (F-13, 2026-10-18) — Navegador Chromium (Chrome, Edge, Brave, Vivaldi,
   Opera) com mais de uma janela fica "em uso", com o motivo à mostra.
@@ -133,6 +154,8 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
   - **Limite conhecido:** janela em outra área de trabalho virtual está "cloaked" e não entra na conta.
     - Exemplo: um Chrome com 1 janela aqui e 2 em outra área conta como 1, então a R29 não vale.
     - O WM_CLOSE também só chega à janela visível.
+  - **No Mac** (emenda): como o `windowCount` só vê janela na tela, o Chromium com várias janelas minimizadas ou em outro Espaço
+    pode contar menos; o Folga confere com o próprio app antes de tratar como uma janela só.
 
 - **R28 Projeto de código não é lixo** (D20) — Nenhum arquivo dentro de uma pasta com `.git`,
   `package.json`, `pyvenv.cfg`, `pyproject.toml`, `Cargo.toml` ou `go.mod` aparece na busca nem passa na
@@ -160,10 +183,18 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
     nunca vira comando (mesma ideia da R24).
   - Se o Windows recusar uma vez, o Folga para de tentar até reiniciar. Avisar nunca derruba o que estava
     acontecendo.
+  - **No Mac** (emenda, plano 4): dentro do Folga.app quem avisa é o próprio `Folga --notify` (nome e clique do
+    app); fora dele, ou se o app recusar, o `osascript` de reserva. Título e corpo só pelo ambiente, nunca em
+    argumento. Falha do `osascript` de reserva não cala o app: ele volta a ser tentado depois do recuo de 10 min.
+    O menu da barra mostra a contagem de avisos e abre a tela Avisos. Além da proposta do vigia, **aviso crítico
+    também notifica** (decisão 20), uma vez por id até ele sair da lista; atenção e informação ficam só na tela.
+    Testes que sobem o servidor usam `FOLGA_NOTIFY=0`: nenhum processo de notificação é disparado.
 
 - **R33 O logon abre a janela** (pedido do Antônio, 2026-10-18) — O atalho da pasta Inicializar roda o
   `launch.mjs` **sem** `--no-window`: sobe o servidor e abre a janela. O `--no-window` continua existindo para
   quem quiser só o servidor. O Auto Care vale com a janela aberta ou fechada (R13).
+  - **No Mac** (emenda): o equivalente é um LaunchAgent em `~/Library/LaunchAgents`, escrito pelo Node, desligado por padrão (P04);
+    ao ligar o Mac abre só o ícone, nunca a janela (decisão 15).
 
 - **R35 "Resolver" resolve** (pedido do Antônio, 2026-10-18) — Cada problema do Início leva a uma ação, não a
   uma tela genérica.
@@ -196,10 +227,15 @@ Cada regra tem um número. Ticket, teste ou revisão cita a regra pelo número. 
   - **Travamento:** um aviso por app que travou nas últimas 24 h.
   - **Antivírus:** crítico se desligado ou desatualizado.
   - **Sonda:** crítico quando ela fica mais de 30 s fora do ar.
+  - **No Mac** (emenda, plano 4): travamento vem de `~/Library/Logs/DiagnosticReports` (`.ips`/`.crash` do nível
+    de cima, sem seguir link, só os primeiros 4 KB). No lugar do antivírus, **segurança** em nível `info`:
+    FileVault, Gatekeeper e SIP desligados, lidos por comando fixo e só leitura; saída fora do formato = sem aviso.
 - **R27** — Em "só críticos", os avisos de atenção e de informação não aparecem no ícone da barra
   lateral; continuam na tela Avisos.
 
 ## Pegada (requisito não funcional)
 - **R18 Orçamento** — Em segundo plano, Node + sonda somam **até 120 MB** de working set privado e menos
   de 1 % de CPU na média. A janela do Edge só existe enquanto está aberta. O ticket F-09 mede.
+  - **No Mac** (emenda): a pegada aceita, medida em 2026-10-21, é ~180 MB só com o ícone e ~350 MB com a janela aberta (WebKit);
+    120/150 MB viram referência, não trava (decisão 19).
 - **R19 Leitura** — A sonda lê a cada 2 s. Ajustável; não descer abaixo de 1 s.

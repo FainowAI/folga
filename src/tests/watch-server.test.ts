@@ -16,7 +16,7 @@ writeFileSync(join(dataDir, 'settings.json'), JSON.stringify({ ...DEFAULT_SETTIN
 
 const server = spawn(process.execPath, ['--no-warnings', join(root, 'src', 'server.ts')], {
   env: {
-    ...process.env, FOLGA_PORT: String(PORT), FOLGA_DATA_DIR: dataDir,
+    ...process.env, FOLGA_NOTIFY: '0', FOLGA_PORT: String(PORT), FOLGA_DATA_DIR: dataDir,
     FOLGA_FAKE_PROBE: join(root, 'src', 'tests', 'fake-probe.mjs'),
     FAKE_AVAIL_GB: '1.5', FAKE_NOTEPAD_MB: '800',   // 16 GB no total: memLoad ~91 %, com 800 MB parados
     FOLGA_CLOSE_WAIT_MS: '300', FOLGA_MEASURE_WAIT_MS: '300', FOLGA_WATCH_MS: '400',
@@ -33,7 +33,7 @@ try {
   let pend: Suggestion[] = [];
   for (let i = 0; i < 60 && pend.length === 0; i++) {
     await sleep(200);
-    try { pend = (await get<Suggestion[]>('/api/suggestions')).filter(s => s.status === 'pendente'); } catch { /* subindo */ }
+    try { pend = (await get<Suggestion[]>('/api/suggestions')).filter(s => s.status === 'pendente' && s.kind === 'liberar_memoria'); } catch { /* subindo */ }
   }
   assert.equal(pend.length, 1, 'o vigia deveria ter proposto sozinho');
   const s = pend[0]!;
@@ -48,7 +48,7 @@ try {
   assert.ok(antes.apps.some(a => a.key === 'notepad'), 'o notepad não pode ter sido fechado sem o clique');
   assert.deepEqual(await get<LogEntry[]>('/api/log?limit=5'), []);
   await sleep(1_200);   // vários ciclos do vigia
-  assert.equal((await get<Suggestion[]>('/api/suggestions')).length, 1, 'não repete o cartão a cada ciclo');
+  assert.equal((await get<Suggestion[]>('/api/suggestions')).filter(s => s.kind === 'liberar_memoria').length, 1, 'não repete o cartão a cada ciclo');
   assert.ok((await get<MemoryState>('/api/state')).apps.some(a => a.key === 'notepad'));
   console.log('ok  R20: nada foi executado e o cartão não se repete');
 

@@ -5,11 +5,12 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { dataDir } from './platform.ts';
 import { protectedRows } from './protegidos.ts';
 import type { AppGroup } from './types.ts';
 
 const PORT = Number(process.env.FOLGA_PORT ?? 4780);
-const DATA_DIR = process.env.FOLGA_DATA_DIR ?? join(process.env.LOCALAPPDATA ?? '.', 'Folga');
+const DATA_DIR = dataDir();
 const BASE = `http://127.0.0.1:${PORT}`;
 const token = () => readFileSync(join(DATA_DIR, 'agent-token'), 'utf8').trim();
 
@@ -18,7 +19,7 @@ type Json = Record<string, unknown>;
 type Tool = { name: string; description: string; inputSchema: Json; readOnly: boolean; run: (args: Json) => Promise<unknown> };
 
 async function get(path: string): Promise<unknown> {
-  const res = await fetch(BASE + path, { signal: AbortSignal.timeout(15_000) });
+  const res = await fetch(BASE + path, { headers: { 'x-folga-token': token() }, signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`Folga respondeu ${res.status}`);
   return res.json();
 }
@@ -54,7 +55,7 @@ const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : u
 export const TOOLS: Tool[] = [
   {
     name: 'ver_memoria',
-    description: 'Use para saber como está a memória do PC agora: porcentagem em uso e os apps agrupados em parados, em uso e protegidos. Os protegidos vêm detalhados (R36): os maiores, o motivo de cada um em palavras e, nos processos sem janela, de que app eles são serviço. Nenhum protegido pode ser fechado; só a lista "nunca fechar" do usuário sai de lá, em Ajustes.',
+    description: 'Use para saber como está a memória do computador agora: porcentagem em uso e os apps agrupados em parados, em uso e protegidos. Os protegidos vêm detalhados (R36): os maiores, o motivo de cada um em palavras e, nos processos sem janela, de que app eles são serviço. Nenhum protegido pode ser fechado; só a lista "nunca fechar" do usuário sai de lá, em Ajustes.',
     inputSchema: nada,
     readOnly: true,
     run: async () => {
@@ -91,17 +92,17 @@ export const TOOLS: Tool[] = [
   },
   {
     name: 'ver_disco',
-    description: 'Use para ver quanto espaço livre há em cada unidade de disco do PC.',
+    description: 'Use para ver quanto espaço livre há no disco (no computador, em cada unidade). No Mac, liberavelPeloSistemaGB é o que o macOS libera sozinho quando precisa e não está somado em livreGB.',
     inputSchema: nada,
     readOnly: true,
     run: async () => {
-      const d = await get('/api/disk') as { drive: string; total: number; free: number }[];
-      return d.map(x => ({ unidade: x.drive, totalGB: +(x.total / GB).toFixed(1), livreGB: +(x.free / GB).toFixed(1), livrePorcento: x.total ? Math.round((x.free / x.total) * 100) : null }));
+      const d = await get('/api/disk') as { drive: string; total: number; free: number; purgeable?: number }[];
+      return d.map(x => ({ unidade: x.drive, totalGB: +(x.total / GB).toFixed(1), livreGB: +(x.free / GB).toFixed(1), livrePorcento: x.total ? Math.round((x.free / x.total) * 100) : null, ...(x.purgeable ? { liberavelPeloSistemaGB: +(x.purgeable / GB).toFixed(1) } : {}) }));
     },
   },
   {
     name: 'procurar_arquivos_parados',
-    description: 'Use para achar arquivos grandes que o Antônio não abre há muito tempo, nas pastas dele (Downloads, Área de Trabalho, Documentos, Imagens, Vídeos, Músicas). Pode levar alguns segundos. Devolve os 40 maiores com tamanho, último uso e como esse uso foi medido (base).',
+    description: 'Use para achar arquivos grandes que o usuário não abre há muito tempo, nas pastas dele (Downloads, Área de Trabalho, Documentos, Imagens, Vídeos, Músicas). Pode levar alguns segundos. Devolve os 40 maiores com tamanho, último uso e como esse uso foi medido (base).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -122,7 +123,8 @@ export const TOOLS: Tool[] = [
         buscaTruncada: r.truncated,
         semUsoHaDias: r.olderThanDays,
         minMB: mb(r.minBytes),
-        // base: 'acesso' = último acesso registrado; 'recentes' = lista Recentes do Windows; 'modificacao' = só a data de modificação
+        // base: 'acesso' = último acesso registrado; 'recentes' = lista Recentes do Windows; 'modificacao' = só a data de modificação;
+        // 'spotlight' = última abertura registrada pelo Spotlight do Mac; 'adicionado' = quando o arquivo chegou na pasta (Mac)
         arquivos: r.files.slice(0, 40).map(f => ({ caminho: texto(f.path), MB: mb(f.size), ultimoUso: dia(f.lastUsed), base: f.basis })),
         mostrando: Math.min(40, r.files.length),
       };
@@ -139,8 +141,23 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: 'ver_dados_dos_apps',
+    description: 'Use para ver quanto cada app guarda no disco (Suporte a Aplicativos, Caches, AppData) e quais caches o Folga pode limpar agora (podeLimpar). Para propor limpeza, use os ids de cache com podeLimpar.',
+    inputSchema: nada,
+    readOnly: true,
+    run: async () => {
+      type It = { id: string; bytes: number; actionable: boolean; note?: string };
+      const r = await get('/api/appdata') as { entries: { name: string; where: string; bytes: number; items: It[]; notes: { text: string; bytes: number }[] }[] };
+      return r.entries.slice(0, 20).map(e => ({
+        app: texto(e.name, 80), onde: e.where, MB: mb(e.bytes),
+        caches: e.items.map(i => ({ id: texto(i.id, 160), MB: mb(i.bytes), podeLimpar: i.actionable, nota: i.note ? texto(i.note, 160) : undefined })),
+        notas: e.notes.map(n => `${texto(n.text, 160)} (${mb(n.bytes)} MB)`),
+      }));
+    },
+  },
+  {
     name: 'ver_inicializacao',
-    description: 'Use para ver quais programas abrem junto com o Windows (e se estão ativos). Ajuda a explicar o que pesa logo depois de ligar o PC.',
+    description: 'Use para ver quais programas abrem junto com o sistema (Windows: inicialização; Mac: LaunchAgents e LaunchDaemons) e se estão ativos. Ajuda a explicar o que pesa logo depois de ligar o computador.',
     inputSchema: nada,
     readOnly: true,
     run: async () => {
@@ -150,7 +167,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: 'ver_sugestoes',
-    description: 'Use para ver as sugestões que ainda aguardam a decisão do Antônio na tela (pendentes), para não repetir uma que já está lá.',
+    description: 'Use para ver as sugestões que ainda aguardam a decisão do usuário na tela (pendentes), para não repetir uma que já está lá.',
     inputSchema: nada,
     readOnly: true,
     run: async () => {

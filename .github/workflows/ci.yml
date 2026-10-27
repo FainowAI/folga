@@ -1,0 +1,24 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - if: runner.os == 'macOS'
+        run: node scripts/build-probe.mjs && node scripts/probe-smoke.mjs
+      - if: runner.os == 'Windows'
+        run: node scripts/probe-smoke.mjs
+      - if: runner.os == 'macOS'
+        run: npm run build && node scripts/build-probe.mjs && node scripts/mac-app.mjs build --adhoc && node scripts/mac-app.mjs check build/Folga.app

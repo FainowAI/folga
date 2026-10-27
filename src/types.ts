@@ -9,16 +9,19 @@ export type ProbeProcess = {
   windowCount?: number;        // quantas dessas janelas (R29); sondas antigas não mandam
   accessible: boolean;         // OpenProcess com o token do usuário funcionou
 };
+export type MemPressure = 'normal' | 'warn' | 'critical';
 export type ProbeSnapshot = {
   type: 'snapshot'; t: number; memLoad: number; totalPhys: number; availPhys: number;
   foregroundPid: number | null;
   audioPids?: number[];        // pids com sessão de áudio ativa no dispositivo padrão (F-11); ausente = sonda antiga
   diskActive?: number | null;  // tempo de atividade do disco em %, como no Gerenciador de Tarefas; null na 1ª leitura
+  memPressure?: MemPressure;   // só no Mac (kern.memorystatus_vm_pressure_level); ausente = sonda do Windows
+  swapUsed?: number;           // bytes de swap em uso (só no Mac)
   processes: ProbeProcess[];
 };
 // Node → sonda
 export type ProbeCommand =
-  | { type: 'close'; id: string; pids: number[] }   // WM_CLOSE em todas as janelas visíveis
+  | { type: 'close'; id: string; pids: number[]; key?: string }   // WM_CLOSE em todas as janelas visíveis; key: Mac só fecha pid desse bundle id
   | { type: 'kill'; id: string; pids: number[] };   // só para apps em mayForceQuit (P03)
 export type ProbeReply = { type: 'reply'; id: string; ok: boolean; windowsClosed: number };
 
@@ -44,6 +47,8 @@ export type LogEntry = {
 export type Settings = {
   idleMinutes: number; busyCpuPercent: number; sampleSeconds: number;
   autoCareEnabled: boolean; autoCareThreshold: number; autoCareCooldownMinutes: number;
+  autoCareTrigger: 'percent' | 'pressure';   // Mac: pressão do sistema; Windows e arquivo antigo: percentual
+  autoCarePressure: 'warn' | 'critical';     // a partir de qual pressão dispara (só no modo pressure)
   neverClose: string[]; mayForceQuit: string[];
   // v2
   warningsLevel: 'todos' | 'criticos';   // R27
@@ -56,6 +61,7 @@ export type MemoryState = {
   t: number; memLoad: number; totalPhys: number; availPhys: number;
   apps: AppGroup[]; freed: ReleaseResult[]; settings: Settings; startedAt: number;
   autoCare: { nextEligibleAt: number | null; lastRunAt: number | null };   // preenchido no F-06
+  memPressure?: MemPressure; swapUsed?: number;   // só no Mac
   samples?: Sample[];   // últimos 60 s para os gráficos de linha do Início; ausente = servidor antigo
 };
 /** Uma leitura para os gráficos: memória em uso e atividade do disco, em %. */
@@ -70,6 +76,8 @@ export const DEFAULT_SETTINGS: Settings = {
   autoCareEnabled: false,
   autoCareThreshold: 92,
   autoCareCooldownMinutes: 10,
+  autoCareTrigger: 'percent',
+  autoCarePressure: 'warn',
   // terminais, editores e apps de agente rodam agentes e servidores; fechar mata o que está dentro (R05)
   neverClose: ['windowsterminal', 'cmd', 'powershell', 'pwsh', 'code', 'cursor', 'claude', 'antigravity ide', 'codex'],
   mayForceQuit: [],
@@ -85,7 +93,7 @@ export type View = 'inicio' | 'memoria' | 'arquivos' | 'assistente' | 'avisos' |
 
 // Avisos (D15, R26, R27)
 export type Severity = 'critico' | 'atencao' | 'info';
-export type WarningKind = 'memoria' | 'disco' | 'travamento' | 'antivirus' | 'autocare' | 'sonda' | 'ajustes';
+export type WarningKind = 'memoria' | 'disco' | 'travamento' | 'antivirus' | 'seguranca' | 'autocare' | 'sonda' | 'ajustes';
 export type Warning = {
   id: string;              // estável por causa: 'memoria', 'disco:C:', 'travamento:chrome', 'antivirus', ...
   kind: WarningKind; severity: Severity;
@@ -93,14 +101,15 @@ export type Warning = {
   view?: View;             // onde se resolve
   firstSeen: number; lastSeen: number; active: boolean;
 };
-export type DiskInfo = { drive: string; total: number; free: number };
-export type StartupApp = { name: string; command: string; source: 'registro_usuario' | 'registro_maquina' | 'pasta_inicializar'; enabled: boolean };
+export type DiskInfo = { drive: string; total: number; free: number; purgeable?: number };   // purgeable (Mac): o que o sistema libera sozinho; nunca entra em free
+export type StartupApp = { name: string; command: string; source: 'registro_usuario' | 'registro_maquina' | 'pasta_inicializar' | 'launchagent_usuario' | 'launchagent_sistema' | 'launchdaemon'; enabled: boolean };
 
 // Arquivos parados (D16)
-export type StaleBasis = 'acesso' | 'recentes' | 'modificacao';
+export type StaleBasis = 'acesso' | 'recentes' | 'modificacao' | 'spotlight' | 'adicionado';
 export type StaleFile = {
   path: string; name: string; root: string;   // root = pasta do usuário onde foi achado
   size: number; lastUsed: number; lastModified: number; basis: StaleBasis;
+  isApp?: true;   // Mac: pasta .app velha direto no Downloads, um item com o tamanho somado
 };
 export type StaleScan = {
   t: number; durationMs: number; roots: string[]; scanned: number; truncated: boolean;
@@ -115,10 +124,16 @@ export type QuickCleanItem = {
   category: QuickCleanCategory; label: string; bytes: number; files: number;
   actionable: boolean;     // lixeira: false (só informação)
   note?: string;           // ex.: "Chrome aberto: feche para limpar o cache"
+  unknown?: true;          // não deu para ler (Mac sem Acesso Total ao Disco): bytes 0 aqui quer dizer "desconhecido"
 };
 
+// Dados dos apps: mede tudo; limpável só o que a allowlist de cache produz, de app fechado
+export type AppDataItem = { id: string; label: string; path: string; bytes: number; files: number; actionable: boolean; note?: string };
+export type AppDataEntry = { id: string; name: string; where: string; bytes: number; items: AppDataItem[]; notes: { text: string; bytes: number }[] };
+export type AppDataScan = { t: number; durationMs: number; truncated: boolean; totalBytes: number; entries: AppDataEntry[] };
+
 // Sugestões: o agente (ou a tela) propõe, o usuário aprova (R20–R24)
-export type SuggestionKind = 'lixeira' | 'limpeza_rapida' | 'liberar_memoria';
+export type SuggestionKind = 'lixeira' | 'limpeza_rapida' | 'liberar_memoria' | 'dados_apps';
 export type SuggestionStatus = 'pendente' | 'feita' | 'ignorada' | 'falhou';
 export type SuggestionItem = {
   id: string; label: string; detail: string; bytes: number;   // id = caminho, chave de app ou categoria
@@ -155,4 +170,8 @@ export type Emit = (event: 'warnings' | 'suggestions' | 'agent', data: unknown) 
 export const SYSTEM_PROCESSES: readonly string[] = [
   'explorer', 'dwm', 'csrss', 'winlogon', 'shellexperiencehost', 'startmenuexperiencehost',
   'searchhost', 'textinputhost', 'applicationframehost', 'lockapp',
+  // Mac: bundle id ou nome do executável, minúsculos
+  // ponytail: nomes do Windows e do Mac não colidem; uma lista evita process.platform num arquivo que a interface importa
+  'launchd', 'windowserver', 'com.apple.loginwindow', 'com.apple.dock', 'com.apple.finder', 'com.apple.systemuiserver',
+  'com.apple.controlcenter', 'com.apple.notificationcenterui', 'com.apple.spotlight', 'com.apple.windowmanager',
 ];

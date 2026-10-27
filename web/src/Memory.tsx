@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import type { AppGroup, MemoryState, ReleaseResponse, View } from '../../src/types';
 import { protectedRows, type ProtectedRow } from '../../src/protegidos';
 import type { Source } from './mock';
-import { NB, OUTCOME, ago, gb, pct, plural, size } from './format';
+import { NB, OUTCOME, ago, autoCareAt, gb, pct, plural, pressureName, size } from './format';
 import { Particles } from './Particles';
 import { selection } from './selection';
 
@@ -149,7 +149,11 @@ export function Memory({ state, source, go }: { state: MemoryState | null; sourc
       <header className="mem-head">
         <div>
           <h1 className="page-title" id="mem-title">Liberar memória</h1>
-          <p className="muted">{settings.autoCareEnabled ? `Auto Care começa em ${pct(settings.autoCareThreshold)}` : 'Auto Care desligado'}</p>
+          <p className="muted">{!settings.autoCareEnabled ? 'Auto Care desligado'
+            : settings.autoCareTrigger === 'pressure' ? `Auto Care ${autoCareAt(settings)}` : `Auto Care começa ${autoCareAt(settings)}`}</p>
+          {state.memPressure && (
+            <p className="muted">Pressão: {pressureName[state.memPressure]}{state.swapUsed !== undefined && ` · swap ${size(state.swapUsed)}`}</p>
+          )}
         </div>
         <p className="mem-usage">{gb(used)} de {gb(state.totalPhys)}{NB}GB em uso · {pct(state.memLoad)}</p>
       </header>
@@ -162,7 +166,7 @@ export function Memory({ state, source, go }: { state: MemoryState | null; sourc
             <div className="meter-label"><span>Memória usada</span><strong>{pct(state.memLoad)}</strong></div>
             <div className="meter-bar" ref={barRef}>
               <div className="meter-fill" style={{ transform: `scaleY(${Math.min(100, state.memLoad) / 100})` }} />
-              {settings.autoCareEnabled && (
+              {settings.autoCareEnabled && settings.autoCareTrigger === 'percent' && (
                 <div className="meter-tick" style={{ bottom: `${settings.autoCareThreshold}%` }} aria-hidden="true" />
               )}
             </div>

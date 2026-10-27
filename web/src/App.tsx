@@ -30,8 +30,14 @@ const TOP: [View, string][] = [
   ['avisos', 'Avisos'], ['autocare', 'Auto Care'], ['registro', 'Registro'],
 ];
 
+// Vista inicial pelo fragmento (#avisos): o menu da barra do Mac abre a janela assim, sem ponte. Só nomes do menu lateral.
+const viewFromHash = (): View | null => {
+  const h = location.hash.slice(1);
+  return TOP.some(([v]) => v === h) ? (h as View) : null;
+};
+
 export function App() {
-  const [view, setView] = useState<View>('inicio');
+  const [view, setView] = useState<View>(() => viewFromHash() ?? 'inicio');
   const [state, setState] = useState<MemoryState | null>(null);
   // "Resolver" em Início pode abrir o Assistente já com o pedido. O número faz o mesmo pedido valer de novo.
   const [ask, setAsk] = useState<{ text: string; n: number } | null>(null);
@@ -43,6 +49,11 @@ export function App() {
   const [warnings, setWarnings] = useState<Warning[]>([]);
 
   useEffect(() => source.subscribe(setState), []);
+  useEffect(() => {
+    const on = () => { const v = viewFromHash(); if (v) setView(v); };
+    window.addEventListener('hashchange', on);
+    return () => window.removeEventListener('hashchange', on);
+  }, []);
 
   // Selo de Avisos: só os ativos; em "só críticos" (R27) contam apenas os críticos.
   useEffect(() => {

@@ -38,9 +38,14 @@ const ROUTES: Record<string, unknown> = {
     { id: 'memoria', kind: 'memoria', severity: 'critico', title: 'Memória alta', detail: '98 %', view: 'memoria', firstSeen: 0, active: true },
     { id: 'velho', kind: 'sonda', severity: 'info', title: 'Antigo', detail: '-', firstSeen: 0, active: false },
   ],
-  'GET /api/disk': [{ drive: 'C:', total: 500 * GB, free: 40 * GB }],
+  'GET /api/disk': [{ drive: 'C:', total: 500 * GB, free: 40 * GB }, { drive: 'Macintosh HD', total: 500 * GB, free: 40 * GB, purgeable: 12 * GB }],
   'POST /api/files/scan': { t: 0, durationMs: 1, roots: ['C:\\Users\\A\\Downloads'], scanned: 9000, truncated: true, accessTracking: true, olderThanDays: 180, minBytes: 10 * MB, files, totalBytes: 99 * GB },
   'GET /api/quickclean': [{ category: 'temp_usuario', label: 'Temporários', bytes: 300 * MB, files: 50, actionable: true }, { category: 'lixeira', label: 'Lixeira', bytes: 5 * MB, files: 2, actionable: false, note: 'só informação' }],
+  'GET /api/appdata': { t: 0, durationMs: 1, truncated: false, totalBytes: 3 * GB, entries: [
+    { id: 'appSupport:Claude', name: 'Claude', where: 'Suporte a Aplicativos', bytes: 2 * GB, notes: [{ text: 'Disco da máquina virtual', bytes: GB }],
+      items: [{ id: 'claude:Cache', label: 'Claude: Cache', path: '/x/Claude/Cache', bytes: 500 * MB, files: 9, actionable: false, note: 'Claude aberto: feche para limpar' }] },
+    ...Array.from({ length: 25 }, (_, i) => ({ id: `caches:a${i}`, name: `a${i}`, where: 'Caches', bytes: MB, notes: [], items: [] })),
+  ] },
   'GET /api/startup-apps': [{ name: 'Discord', command: 'C:\\x\\Discord.exe', source: 'registro_usuario', enabled: true }],
   'GET /api/suggestions': [
     { id: 's1', kind: 'lixeira', title: 'Pendente', reason: 'r', bytes: 10 * MB, items: [{}, {}], status: 'pendente', source: 'agente' },
@@ -91,7 +96,7 @@ await caso('initialize devolve a versão do protocolo que o cliente pediu', asyn
   assert.deepEqual((await rpc('ping')).result, {});
 });
 
-const ESPERADAS = ['ver_memoria', 'ver_avisos', 'ver_disco', 'procurar_arquivos_parados', 'ver_limpeza_rapida', 'ver_inicializacao', 'ver_sugestoes', 'ver_registro'];
+const ESPERADAS = ['ver_dados_dos_apps', 'ver_memoria', 'ver_avisos', 'ver_disco', 'procurar_arquivos_parados', 'ver_limpeza_rapida', 'ver_inicializacao', 'ver_sugestoes', 'ver_registro'];
 await caso('tools/list traz as ferramentas esperadas, todas só de leitura (R20)', async () => {
   const { tools } = (await rpc('tools/list')).result;
   assert.deepEqual(tools.map((t: any) => t.name).sort(), [...ESPERADAS].sort());
@@ -102,6 +107,14 @@ await caso('tools/list traz as ferramentas esperadas, todas só de leitura (R20)
     assert.equal(t.inputSchema.type, 'object');
   }
   assert.deepEqual(Object.keys(tools.find((t: any) => t.name === 'procurar_arquivos_parados').inputSchema.properties).sort(), ['dias', 'minMB']);
+});
+
+await caso('ver_dados_dos_apps: por app, caches com podeLimpar, no máximo 20; nenhuma ferramenta escreve', async () => {
+  const { json } = await call('ver_dados_dos_apps');
+  assert.equal(json.length, 20);
+  assert.deepEqual(json[0], { app: 'Claude', onde: 'Suporte a Aplicativos', MB: 2048, caches: [{ id: 'claude:Cache', MB: 500, podeLimpar: false, nota: 'Claude aberto: feche para limpar' }], notas: ['Disco da máquina virtual (1024 MB)'] });
+  const { tools } = (await rpc('tools/list')).result;
+  assert.deepEqual(tools.filter((t: any) => t.annotations.readOnlyHint !== true).map((t: any) => t.name), []);
 });
 
 await caso('ver_memoria: apps parados e protegidos em MB e GB', async () => {
@@ -150,7 +163,7 @@ await caso('ver_avisos: só os ativos, do mais grave ao menos grave', async () =
 });
 
 await caso('ver_disco, ver_limpeza_rapida, ver_inicializacao e ver_registro resumem a API', async () => {
-  assert.deepEqual((await call('ver_disco')).json, [{ unidade: 'C:', totalGB: 500, livreGB: 40, livrePorcento: 8 }]);
+  assert.deepEqual((await call('ver_disco')).json, [{ unidade: 'C:', totalGB: 500, livreGB: 40, livrePorcento: 8 }, { unidade: 'Macintosh HD', totalGB: 500, livreGB: 40, livrePorcento: 8, liberavelPeloSistemaGB: 12 }]);
   const q = (await call('ver_limpeza_rapida')).json;
   assert.equal(q[0].MB, 300);
   assert.equal(q[1].podeLimpar, false);

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { MemoryState } from '../../src/types';
 import { putSettings } from './api';
-import { NB, ago as since } from './format';
+import { NB, ago as since, autoCareAt } from './format';
 
 const minutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
 const ago = (ms: number) => `há ${since(ms)}`;
@@ -19,6 +19,7 @@ export function AutoCare({ state }: { state: MemoryState | null }) {
     return <section className="page"><h1 className="page-title">Auto Care</h1><p className="muted" role="status">Lendo…</p></section>;
   }
   const { settings, autoCare, t } = state;
+  const pressure = settings.autoCareTrigger === 'pressure';
 
   async function save(patch: Parameters<typeof putSettings>[0]) {
     setSaving(true);
@@ -48,13 +49,35 @@ export function AutoCare({ state }: { state: MemoryState | null }) {
           <span className="ac-dot" aria-hidden="true" />
           <div className="ac-text">
             <label className="ac-name" htmlFor="ac-switch">Memória</label>
-            <span className="ac-hint" id="ac-hint">Em {settings.autoCareThreshold}{NB}%</span>
+            <span className="ac-hint" id="ac-hint">{autoCareAt(settings).replace(/^./, (c) => c.toUpperCase())}</span>
           </div>
           <input id="ac-switch" className="ac-switch" type="checkbox" role="switch" aria-describedby="ac-hint"
             checked={settings.autoCareEnabled} disabled={saving}
             onChange={(e) => void save({ autoCareEnabled: e.target.checked })} />
         </div>
 
+        {/* gatilho por pressão só existe com a sonda do Mac (o servidor recusa no Windows) */}
+        {(state.memPressure !== undefined || pressure) && (
+          <div className="ac-row ac-field">
+            <label className="ac-name" htmlFor="ac-trigger">Começa pela</label>
+            <select id="ac-trigger" className="ac-input ac-select" value={settings.autoCareTrigger} disabled={saving}
+              onChange={(e) => void save({ autoCareTrigger: e.target.value as typeof settings.autoCareTrigger })}>
+              <option value="percent">Percentual</option>
+              <option value="pressure">Pressão de memória</option>
+            </select>
+          </div>
+        )}
+
+        {pressure ? (
+          <div className="ac-row ac-field">
+            <label className="ac-name" htmlFor="ac-pressure">Começa quando a pressão ficar</label>
+            <select id="ac-pressure" className="ac-input ac-select" value={settings.autoCarePressure} disabled={saving}
+              onChange={(e) => void save({ autoCarePressure: e.target.value as typeof settings.autoCarePressure })}>
+              <option value="warn">Amarela</option>
+              <option value="critical">Vermelha</option>
+            </select>
+          </div>
+        ) : (
         <div className="ac-row ac-field">
           <label className="ac-name" htmlFor="ac-threshold">Começa quando a memória chegar a (%)</label>
           <input id="ac-threshold" className="ac-input" type="number" inputMode="numeric" min={50} max={99} step={1}
@@ -62,6 +85,7 @@ export function AutoCare({ state }: { state: MemoryState | null }) {
             onChange={(e) => setDraft(e.target.value)} onBlur={commitThreshold}
             onKeyDown={(e) => { if (e.key === 'Enter') commitThreshold(); }} />
         </div>
+        )}
 
         <p className="ac-error" id="ac-error" role="alert" aria-live="assertive">{error}</p>
       </div>

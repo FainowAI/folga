@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import type { ProbeCommand, ProbeReply, ProbeSnapshot } from './types.ts';
 
-type CommandBody = { type: ProbeCommand['type']; pids: number[] };
+type CommandBody = { type: ProbeCommand['type']; pids: number[]; key?: string };
 
 export type Probe = {
   send(cmd: CommandBody, timeoutMs?: number): Promise<ProbeReply>;

@@ -10,10 +10,14 @@ const GROUPS: { sev: Severity; label: string }[] = [
 type Filter = 'todos' | Severity;
 const FILTERS: { key: Filter; label: string }[] = [{ key: 'todos', label: 'Todos' }, ...GROUPS.map(g => ({ key: g.sev, label: g.label }))];
 
+const IS_MAC = /Mac/.test(navigator.platform);
 const SOURCE: Record<StartupApp['source'], string> = {
   registro_usuario: 'Registro · só este usuário',
   registro_maquina: 'Registro · todos os usuários',
   pasta_inicializar: 'Pasta Inicializar',
+  launchagent_usuario: 'LaunchAgent · só você',
+  launchagent_sistema: 'LaunchAgent · todos os usuários',
+  launchdaemon: 'LaunchDaemon · sistema',
 };
 
 const Check = () => (
@@ -116,13 +120,15 @@ export function Avisos({ state, go }: { state: MemoryState | null; go: (v: View)
         </p>
 
         <section className="av-startup" aria-labelledby="av-startup-title">
-          <h2 className="av-startup-title" id="av-startup-title">Apps que abrem com o Windows</h2>
+          <h2 className="av-startup-title" id="av-startup-title">{IS_MAC ? 'Apps que abrem com o Mac' : 'Apps que abrem com o Windows'}</h2>
           <p className="muted">
             {apps === null ? 'Lendo a lista… ' : `${plural(enabledApps, 'ativo', 'ativos')} de ${apps.length}. `}
-            Só leitura: para ligar ou desligar, use Configurações do Windows › Aplicativos › Inicialização.
+            {IS_MAC
+              ? 'Só leitura. Itens de login (Ajustes do Sistema › Geral › Itens de Início) não aparecem aqui: o macOS só os mostra com senha de administrador.'
+              : 'Só leitura: para ligar ou desligar, use Configurações do Windows › Aplicativos › Inicialização.'}
           </p>
           {appsFailed && apps === null && <p className="av-error" role="alert">Não deu para ler os apps de inicialização agora.</p>}
-          {apps !== null && apps.length === 0 && <p className="muted">Nenhum app configurado para abrir com o Windows.</p>}
+          {apps !== null && apps.length === 0 && <p className="muted">Nenhum app configurado para abrir com o {IS_MAC ? 'Mac' : 'Windows'}.</p>}
           {sorted.length > 0 && (
             <ul className="av-startup-list">
               {sorted.map(a => (

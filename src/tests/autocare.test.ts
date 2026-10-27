@@ -1,7 +1,7 @@
 // Auto Care: decisão pura (R10–R12). Sem processos reais.
 import assert from 'node:assert/strict';
-import { decide, emptyAutoCare, finishRun, type AutoCareMemory } from '../autocare.ts';
-import { DEFAULT_SETTINGS, type AppGroup, type Settings } from '../types.ts';
+import { decide, emptyAutoCare, finishRun, pressureAtLeast, type AutoCareMemory } from '../autocare.ts';
+import { DEFAULT_SETTINGS, type AppGroup, type MemPressure, type Settings } from '../types.ts';
 
 const app = (key: string, state: AppGroup['state']): AppGroup => ({
   key, name: key, pids: [1], privateWorkingSet: 100, cpuPercent: 0, state, reason: 'idle', lastFocusedAt: null,
@@ -18,6 +18,18 @@ const ok = (name: string) => { passed++; console.log(`ok  ${name}`); };
   for (let i = 0; i < 5; i++) { const d = decide(m, read(99), { ...on, autoCareEnabled: false }, i); assert.equal(d.keys, null); m = d.mem; }
   assert.equal(m.above, 0);
   ok('desligado nunca dispara');
+}
+{
+  const pr: Settings = { ...on, autoCareTrigger: 'pressure', autoCarePressure: 'warn', autoCareThreshold: 99 };
+  const at = (p?: MemPressure) => ({ memLoad: 60, apps, memPressure: p });
+  assert.deepEqual(decide(decide(emptyAutoCare(), at('warn'), pr, 0).mem, at('critical'), pr, 1).keys, ['calc', 'notepad']);
+  assert.equal(decide(decide(emptyAutoCare(), at('normal'), pr, 0).mem, at('normal'), pr, 1).keys, null);
+  assert.equal(decide(decide(emptyAutoCare(), at(), pr, 0).mem, at(), pr, 1).keys, null);   // sem pressão: quieto
+  const crit = { ...pr, autoCarePressure: 'critical' as const };
+  assert.equal(decide(decide(emptyAutoCare(), at('warn'), crit, 0).mem, at('warn'), crit, 1).keys, null);
+  assert.equal(pressureAtLeast(undefined, 'warn'), false);
+  assert.equal(pressureAtLeast('critical', 'warn'), true);
+  ok('gatilho por pressão: warn/critical disparam, normal e ausente não, critical exige critical');
 }
 {
   const d = decide(emptyAutoCare(), read(95), on, 0);

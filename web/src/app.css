@@ -387,3 +387,4 @@
 
 .set-startup { display: flex; gap: 10px; align-items: flex-start; max-width: 60ch; color: var(--muted); line-height: 1.5; cursor: pointer; }
 .set-startup input { margin-top: 3px; accent-color: var(--accent); }
+.ac-select { width: auto; text-align: left; }

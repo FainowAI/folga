@@ -13,6 +13,7 @@ const TOOL_TEXT: Record<string, string> = {
   ver_disco: 'consultou: disco',
   procurar_arquivos_parados: 'procurou arquivos parados',
   ver_limpeza_rapida: 'consultou: limpeza rápida',
+  ver_dados_dos_apps: 'consultou: dados dos apps',
   ver_inicializacao: 'consultou: inicialização',
   ver_sugestoes: 'consultou: sugestões',
   ver_registro: 'consultou: registro',

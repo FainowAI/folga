@@ -1,0 +1,16 @@
+system = {
+	services = {
+		       0   (pe) 	com.apple.lskdd
+		       0   (pe) 	com.apple.kernelmanager_helper
+		     548      - 	com.apple.runningboardd
+		       0      - 	com.apple.installcoordination_proxy
+		       0      1 	com.apple.wifiFirmwareLoader
+		       0      - 	com.apple.uninstalld
+	}
+
+	disabled services = {
+		"net.mullvad.daemon" => enabled
+		"com.openssh.sshd" => enabled
+		"com.apple.CSCSupportd" => disabled
+		"com.apple.ftpd" => disabled
+	}

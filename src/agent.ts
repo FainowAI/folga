@@ -3,9 +3,9 @@
 // valida e vira cartão que o usuário aprova na tela (R20–R24). Um turno por vez, teto de 120 s (R25).
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir, userInfo } from 'node:os';
+import { basename, dirname, isAbsolute, join, posix } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { SuggestionError } from './suggestions.ts';
 import type {
@@ -24,6 +24,10 @@ export type AgentDeps = {
   turnTimeoutMs?: number;                       // padrão 120 s (R25)
   launch?: (t: TurnInput) => Launch;            // troca o comando do provedor (script fake)
   killTree?: (pid: number) => void;             // troca o taskkill (teste confere quando ele é chamado)
+  disclaim?: (l: Launch) => Launch;             // troca o embrulho do --disclaim (teste do código 126)
+  findCli?: (p: AgentProvider) => string | null; // troca a busca do binário do CLI
+  turnOpen?: () => string | void;               // o servidor cria o agent-token só durante o turno
+  turnClose?: (t: string | void) => void;       // recebe o que o turnOpen daquele turno devolveu
 };
 export type SendResult = { ok: true } | { erro: string; status: number };
 
@@ -32,8 +36,8 @@ const MAX_MESSAGES = 200;
 const MAX_SUGGESTIONS_PER_MESSAGE = 5;
 const TOOL_PREFIX = 'mcp__folga__';
 const FENCE = /```folga-sugestao[ \t]*\r?\n([\s\S]*?)```/g;
-const KINDS: readonly SuggestionKind[] = ['lixeira', 'limpeza_rapida', 'liberar_memoria'];
-const KIND_BY_TIPO: Record<string, SuggestionKind> = { lixeira: 'lixeira', limpeza_rapida: 'limpeza_rapida', liberar_memoria: 'liberar_memoria' };
+const KINDS: readonly SuggestionKind[] = ['lixeira', 'limpeza_rapida', 'liberar_memoria', 'dados_apps'];
+const KIND_BY_TIPO: Record<string, SuggestionKind> = { lixeira: 'lixeira', limpeza_rapida: 'limpeza_rapida', liberar_memoria: 'liberar_memoria', dados_apps: 'dados_apps' };
 
 // ---------------------------------------------------------------------------------------------------
 // Binários dos CLIs (ADR 0006): caminho absoluto, shell:false
@@ -41,7 +45,74 @@ const KIND_BY_TIPO: Record<string, SuggestionKind> = { lixeira: 'lixeira', limpe
 const CLAUDE_EXE = process.env.FOLGA_CLAUDE_EXE ?? join(homedir(), '.local', 'bin', 'claude.exe');
 const CODEX_EXE = process.env.FOLGA_CODEX_EXE ?? join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'),
   'npm', 'node_modules', '@openai', 'codex', 'node_modules', '@openai', 'codex-win32-x64', 'vendor', 'x86_64-pc-windows-msvc', 'bin', 'codex.exe');
+const WIN_EXE: Record<AgentProvider, string> = { claude: CLAUDE_EXE, gpt: CODEX_EXE };
 const MISSING: Record<AgentProvider, string> = { claude: 'Claude Code não encontrado', gpt: 'Codex não encontrado' };
+const WHERE_MAC = ' (procurei em ~/.local/bin, no nvm e no Homebrew)';
+export const missing = (p: AgentProvider, platform: NodeJS.Platform = process.platform) => MISSING[p] + (platform === 'darwin' ? WHERE_MAC : '');
+
+// Mach-O fino (64/32 bits, nas duas ordens de byte) e universal (fat e fat64)
+const MACHO = new Set(['cffaedfe', 'feedfacf', 'cefaedfe', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca']);
+const writableByOthers = (st: { uid: number; mode: number }, uid: number) => (st.uid !== uid && st.uid !== 0) || (st.mode & 0o022) !== 0;
+
+/** Caminho real do binário se ele é seguro de executar: absoluto, arquivo comum Mach-O (script nunca), com bit de execução,
+ *  do usuário ou do root e sem escrita para grupo/outros — ele e a pasta onde mora. Senão null. */
+export function safeExe(p: string, uid: number): string | null {
+  if (!isAbsolute(p)) return null;
+  try {
+    const real = realpathSync(p);
+    const st = lstatSync(real);
+    if (!st.isFile() || (st.mode & 0o111) === 0 || writableByOthers(st, uid) || writableByOthers(statSync(dirname(real)), uid)) return null;
+    const head = Buffer.alloc(4);
+    const fd = openSync(real, 'r');
+    try { if (readSync(fd, head, 0, 4, 0) !== 4) return null; } finally { closeSync(fd); }
+    return MACHO.has(head.toString('hex')) ? real : null;
+  } catch { return null; }
+}
+
+const CODEX_JS = '/@openai/codex/bin/codex.js';
+const CODEX_ARCH: Record<string, [string, string]> = { arm64: ['arm64', 'aarch64'], x64: ['x64', 'x86_64'] };
+/** O `codex` do npm é um script (codex.js) que lança o binário do vendor: o Folga roda o binário direto. Só Mac (posix). */
+export function codexNative(real: string, arch: string): string {
+  const a = CODEX_ARCH[arch];
+  if (!a || !real.endsWith(CODEX_JS)) return real;
+  return posix.join(real.slice(0, -'/bin/codex.js'.length), 'node_modules', '@openai', `codex-darwin-${a[0]}`, 'vendor', `${a[1]}-apple-darwin`, 'bin', 'codex');
+}
+
+const nodeVersion = (v: string) => v.slice(1).split('.').map(Number);
+function nvmBins(home: string): string[] {
+  const root = join(home, '.nvm', 'versions', 'node');
+  let vs: string[];
+  try { vs = readdirSync(root).filter(v => /^v\d+(\.\d+)*$/.test(v)); } catch { return []; }
+  vs.sort((x, y) => { const a = nodeVersion(x), b = nodeVersion(y); for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (b[i] ?? 0) - (a[i] ?? 0); return 0; });
+  return vs.map(v => join(root, v, 'bin'));
+}
+
+/** Instalador nativo do Claude Code: ~/.local/bin/claude é link para ~/.local/share/claude/versions/<x.y.z>; o nome real é a versão. */
+function nativeVersion(exe: string, home: string): boolean {
+  if (!/^\d+\.\d+\.\d+$/.test(basename(exe))) return false;
+  try { return dirname(exe) === realpathSync(join(home, '.local', 'share', 'claude', 'versions')); } catch { return false; }
+}
+
+/** Binário do CLI por lista fechada de lugares (nunca o PATH nem o cwd). No Mac: o override do env (se houver, só ele),
+ *  ~/.local/bin, o nvm do maior para o menor, Homebrew e /usr/local/bin; o primeiro que passa no safeExe ganha.
+ *  O nvm vem antes do Homebrew: aqui o claude do Homebrew estava velho (2.1.187) e o validado no ADR 0006 é o do nvm. */
+export function findCli(provider: AgentProvider, o: { home: string; uid: number; arch: string; env: NodeJS.ProcessEnv; platform?: NodeJS.Platform; system?: string[] }): string | null {
+  const override = o.env[provider === 'claude' ? 'FOLGA_CLAUDE_EXE' : 'FOLGA_CODEX_EXE'];
+  if ((o.platform ?? process.platform) !== 'darwin') { const p = override ?? WIN_EXE[provider]; return existsSync(p) ? p : null; }
+  const name = provider === 'claude' ? 'claude' : 'codex';
+  const cands = override ? [override]
+    : [join(o.home, '.local', 'bin'), ...nvmBins(o.home), ...(o.system ?? ['/opt/homebrew/bin', '/usr/local/bin'])].map(d => join(d, name));
+  for (const c of cands) {
+    if (!isAbsolute(c)) continue;
+    let real: string;
+    try { real = realpathSync(c); } catch { continue; }
+    const exe = safeExe(name === 'codex' ? codexNative(real, o.arch) : real, o.uid);
+    // o nome REAL do binário: um link chamado claude para /bin/zsh não passa
+    if (exe && (['claude', 'claude.exe', 'codex'].includes(basename(exe)) || (name === 'claude' && nativeVersion(exe, o.home)))) return exe;
+  }
+  return null;
+}
+const findCliHere = (p: AgentProvider) => findCli(p, { home: homedir(), uid: process.getuid?.() ?? -1, arch: process.arch, env: process.env });
 
 /** Pasta vazia onde os CLIs rodam: a pasta de dados guarda ui-token, ajustes, registro e sugestões, e o agente não deve vê-los. */
 export const agentCwd = (dataDir: string) => join(dataDir, 'agent-cwd');
@@ -52,21 +123,57 @@ export const validSessionId = (provider: AgentProvider, v: unknown): string | nu
 
 const fwd = (p: string) => p.replaceAll('\\', '/');
 const toml = (s: string) => JSON.stringify(s);   // string TOML básica = string JSON
+// Codex 0.157 no Mac (spike do ADR 0006, 22/10): recursos novos que dão ao agente outro jeito de agir. Fora fica o
+// code_mode_host: desligado, o MCP do Folga para de funcionar (o code mode falha fechado).
+export const CODEX_DISABLE_MAC = ['unified_exec', 'multi_agent', 'memories', 'workspace_dependencies', 'skill_mcp_dependency_install',
+  'in_app_local_automation', 'worktrees'];
+const API_KEYS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY', 'CODEX_API_KEY'];
+
+/** Ambiente do CLI. Windows: o do servidor sem as chaves de API (a cota vem da assinatura). Mac: montado do zero — nada de
+ *  NODE_*, DYLD_*, chave de API ou PATH do usuário. O PATH fixo basta: os dois CLIs são nativos, o shell está desligado e o
+ *  MCP vai por caminho absoluto (process.execPath); o bin do bundle não entra para o CLI não achar o node do app pelo nome. */
+export function cliEnv(base: NodeJS.ProcessEnv, platform: NodeJS.Platform): NodeJS.ProcessEnv {
+  if (platform !== 'darwin') {
+    const clean = { ...base };
+    for (const k of API_KEYS) delete clean[k];
+    return clean;
+  }
+  const user = userInfo().username;
+  return {
+    HOME: homedir(), USER: user, LOGNAME: user, ...(base.LANG && /^[A-Za-z0-9_.@-]{1,64}$/.test(base.LANG) ? { LANG: base.LANG } : {}),
+    TMPDIR: base.TMPDIR ?? tmpdir(), PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+  };
+}
+
 const CODEX_DISABLE = ['shell_tool', 'plugins', 'apps', 'browser_use', 'browser_use_external', 'computer_use', 'image_generation',
   'in_app_browser', 'hooks', 'tool_suggest', 'skill_search', 'goals', 'view_image'];
 
+/**
+ * Dentro do Folga.app (Mac) o CLI roda por `probe-mac --disclaim`: responde pelas próprias permissões e não herda o
+ * Acesso Total ao Disco do app. Fora do app (ou no Windows) não há o que herdar: volta o mesmo Launch.
+ */
+export function disclaimed(l: Launch, platform: NodeJS.Platform, insideApp: boolean, helper: string): Launch {
+  if (platform !== 'darwin' || !insideApp) return l;
+  return { ...l, cmd: helper, args: ['--disclaim', l.cmd, ...l.args] };
+}
+const PROBE_MAC = join(import.meta.dirname, '..', 'probe', 'bin', 'probe-mac');
+/** probe-mac --disclaim sai 125 sem executar quando o macOS não tem a API (e o probe-mac pode faltar no bundle): o assistente
+ *  não roda no app (fail closed). 125 é só do disclaim; um 126 do próprio CLI continua a mensagem comum. */
+export const DISCLAIM_UNAVAILABLE = 125;
+export const CODEX_INCOMPATIVEL = 'A versão do Codex instalada não é compatível com o Folga.';
+export const DISCLAIM_FAIL = 'O assistente não roda dentro do app Folga neste macOS: não deu para isolá-lo do app. Nada foi executado.';
+
 /** Comando real de cada provedor, com as flags exatas do spike (ADR 0006). */
-export function realLaunch(t: TurnInput, dataDir: string, port: number): Launch {
+export function realLaunch(t: TurnInput, dataDir: string, port: number, exe = WIN_EXE[t.provider], platform = process.platform): Launch {
   // a cota vem da assinatura: chave de API no ambiente trocaria o faturamento sem o Antônio saber
-  const clean = { ...process.env };
-  for (const k of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY', 'CODEX_API_KEY']) delete clean[k];
+  const clean = cliEnv(process.env, platform);
   // texto que começa com "-" viraria opção do CLI
   const prompt = t.prompt.startsWith('-') ? ' ' + t.prompt : t.prompt;
 
   if (t.provider === 'claude') {
     const home = fwd(homedir());
     return {
-      cmd: CLAUDE_EXE,
+      cmd: exe,
       args: [
         '-p', prompt, '--output-format', 'stream-json', '--verbose',
         ...(t.sessionId ? ['--resume', t.sessionId] : []),
@@ -85,15 +192,16 @@ export function realLaunch(t: TurnInput, dataDir: string, port: number): Launch 
   const common = [
     '--json', '--skip-git-repo-check', '--ignore-user-config',
     '-c', 'sandbox_mode="read-only"',
+    ...(platform === 'darwin' ? ['-c', 'web_search="disabled"'] : []),   // web__run abriria qualquer URL: injeção de prompt vazaria nomes de arquivo/app
     '-c', `mcp_servers.folga.command=${toml(fwd(process.execPath))}`,
     '-c', `mcp_servers.folga.args=[${toml('--no-warnings')},${toml(mcpRoot)}]`,
     '-c', `mcp_servers.folga.env={FOLGA_PORT=${toml(String(port))},FOLGA_DATA_DIR=${toml(fwd(dataDir))}}`,
     '-c', `developer_instructions=${toml(t.system)}`,
-    ...CODEX_DISABLE.flatMap(f => ['--disable', f]),
+    ...(platform === 'darwin' ? [...CODEX_DISABLE, ...CODEX_DISABLE_MAC] : CODEX_DISABLE).flatMap(f => ['--disable', f]),
   ];
   // `exec resume` não aceita --sandbox nem -C (por isso sandbox_mode vai por -c e a pasta é o cwd do processo)
   return {
-    cmd: CODEX_EXE,
+    cmd: exe,
     args: t.sessionId ? ['exec', 'resume', ...common, '--', t.sessionId, prompt] : ['exec', ...common, '--', prompt],
     env: clean,
     cwd: agentCwd(dataDir),
@@ -193,7 +301,37 @@ export function extractSuggestions(raw: string): Extracted {
 // ---------------------------------------------------------------------------------------------------
 type Stored = { id: string; provider: AgentProvider; sessionId: string | null; messages: ChatMessage[] };
 
-export function killTree(pid: number) {
+const SO_TEXTO: Record<'win32' | 'darwin', Record<string, string>> = {
+  win32: {
+    SO: 'Windows', O_USUARIO: 'o Antônio', DO_USUARIO: 'do Antônio', AO_USUARIO: 'ao Antônio', DO_PC: 'do PC',
+    EXEMPLO_CAMINHO: 'C:\\\\Users\\\\Antônio\\\\Downloads\\\\setup-antigo.exe', NOTA_BARRAS: ' Dentro do JSON, barras invertidas em dobro.',
+    PASTAS_SISTEMA: 'Windows, Program Files, ProgramData, AppData fora dos temporários e caches das ferramentas',
+  },
+  // o app é do Vittorio, mas o código vai para o Antônio no PR: nome próprio fica fora do texto do Mac
+  darwin: {
+    SO: 'Mac (macOS)', O_USUARIO: 'o usuário', DO_USUARIO: 'do usuário', AO_USUARIO: 'ao usuário', DO_PC: 'do computador',
+    EXEMPLO_CAMINHO: '/Users/voce/Downloads/instalador-antigo.dmg', NOTA_BARRAS: '',
+    PASTAS_SISTEMA: '/System, /Library, /Applications, ~/Library fora dos caches que as ferramentas mostram',
+  },
+};
+let promptModelo: string | undefined;
+export function promptFor(platform: NodeJS.Platform): string {
+  promptModelo ??= readFileSync(join(import.meta.dirname, 'agent-prompt.md'), 'utf8').trim();
+  const t = SO_TEXTO[platform === 'darwin' ? 'darwin' : 'win32'];
+  return fillPrompt(promptModelo, t);
+}
+export function fillPrompt(model: string, t: Record<string, string>): string {
+  return model.replace(/\{\{(\w+)\}\}/g, (_, k: string) => { if (!(k in t)) throw new Error(`marcador {{${k}}} sem valor no prompt`); return t[k]!; });
+}
+
+export function killTree(pid: number, platform = process.platform) {
+  if (platform === 'darwin') {
+    // só o grupo que o spawn detached criou (pgid == pid do filho): nunca 0/1/negativo nem o nosso próprio grupo
+    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return;
+    // ponytail: servidor morto por SIGKILL deixa o CLI terminar o turno sozinho (o MCP sai quando o stdin fecha); pegar esse caso pediria um vigia de fora.
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* ESRCH: já morreu */ }
+    return;
+  }
   const r = spawnSync('C:\\Windows\\System32\\taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 5_000, stdio: 'ignore' });
   if (r.status !== 0) { try { process.kill(pid); } catch { /* já morreu */ } }
 }
@@ -206,8 +344,6 @@ export function createAgent(deps: AgentDeps) {
   const cwd = agentCwd(deps.dataDir);
   const kill = deps.killTree ?? killTree;
   const timeoutMs = deps.turnTimeoutMs ?? TURN_TIMEOUT_MS;
-  const exists: Record<AgentProvider, boolean> = { claude: existsSync(CLAUDE_EXE), gpt: existsSync(CODEX_EXE) };
-  let system: string | null = null;
 
   const fresh = (provider: AgentProvider): Stored => ({ id: randomUUID(), provider, sessionId: null, messages: [] });
   function load(): Stored {
@@ -241,8 +377,7 @@ export function createAgent(deps: AgentDeps) {
     writeFileSync(mcpFile, JSON.stringify(cfg));
   }
   function systemPrompt(): string {
-    system ??= readFileSync(join(import.meta.dirname, 'agent-prompt.md'), 'utf8').trim();
-    return `${system}\n\nHoje é ${dateBR()}.`;
+    return `${promptFor(process.platform)}\n\nHoje é ${dateBR()}.`;
   }
 
   /** Fecha o turno: grava a resposta (ou o erro) e avisa a tela. Ignora se a conversa já foi trocada (reset). */
@@ -257,6 +392,8 @@ export function createAgent(deps: AgentDeps) {
       const nome = provider === 'claude' ? 'O Claude' : 'O GPT';
       const motivo = why === 'timeout' ? 'Tempo esgotado: parei a resposta.'
         : why === 'stop' ? 'Resposta interrompida.'
+        : acc.error === DISCLAIM_FAIL ? DISCLAIM_FAIL   // texto fixo nosso, não do CLI
+        : provider === 'gpt' && /Unknown feature flag/.test(stderr) ? CODEX_INCOMPATIVEL   // --disable de nome que essa versão não tem
         : `${nome} não respondeu agora. Tente de novo.`;
       if (!why) console.error('[agente] turno sem resposta:', provider, `código ${exitCode}:`, (acc.error ?? acc.softError ?? stderr.trim().split(/\r?\n/).slice(-2).join(' ')).slice(0, 400));
       msg = { id: randomUUID(), role: 'assistant', text: motivo, t: Date.now(), provider, tools: acc.tools.length ? [...new Set(acc.tools)] : undefined, error: true };
@@ -296,11 +433,12 @@ export function createAgent(deps: AgentDeps) {
     finally { if (current === turn) { busy = false; current = null; } }
   }
 
-  function runTurn(provider: AgentProvider, prompt: string) {
+  function runTurn(provider: AgentProvider, prompt: string, exe: string | undefined) {
     const convId = conv.id;
     const acc = newAcc();
     const input: TurnInput = { provider, prompt, sessionId: conv.sessionId, system: systemPrompt(), mcpFile };
-    const l = deps.launch ? deps.launch(input) : realLaunch(input, deps.dataDir, deps.port);
+    const raw = deps.launch ? deps.launch(input) : realLaunch(input, deps.dataDir, deps.port, exe);
+    const l = deps.disclaim ? deps.disclaim(raw) : disclaimed(raw, process.platform, process.env.FOLGA_APP === '1', PROBE_MAC);
     const turn: Turn = { pid: null, convId, killed: null, live: false };
     const killLive = () => { if (turn.live && turn.pid) kill(turn.pid); };
     current = turn;
@@ -312,13 +450,15 @@ export function createAgent(deps: AgentDeps) {
       closed = true;
       clearTimeout(timer);
       killLive();   // o CLI demora a sair depois da resposta; não precisamos esperar
+      deps.turnClose?.(turnToken);
       turn.live = false;
       if (turn.pid) deps.selfPids.delete(turn.pid);
       void finish(turn, convId, provider, acc, turn.killed, code, stderr);
     };
 
     mkdirSync(cwd, { recursive: true });
-    const child = spawn(l.cmd, l.args, { cwd: l.cwd ?? cwd, env: l.env ?? process.env, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const turnToken = deps.turnOpen?.();
+    const child = spawn(l.cmd, l.args, { cwd: l.cwd ?? cwd, env: l.env ?? process.env, shell: false, windowsHide: true, detached: process.platform === 'darwin', stdio: ['ignore', 'pipe', 'pipe'] });
     if (child.pid) { turn.pid = child.pid; turn.live = true; deps.selfPids.add(child.pid); }
     const timer = setTimeout(() => { turn.killed = 'timeout'; killLive(); }, timeoutMs);
 
@@ -327,9 +467,17 @@ export function createAgent(deps: AgentDeps) {
       if (acc.done && !closed) setTimeout(() => done(0), 200);   // resposta completa: fecha já
     });
     child.stderr.on('data', d => { if (stderr.length < 4000) stderr += String(d); });
-    child.on('error', e => { acc.error = acc.error ?? `não consegui iniciar o ${provider === 'claude' ? 'Claude' : 'Codex'}: ${(e as NodeJS.ErrnoException).code ?? 'erro'}`; done(null); });
+    child.on('error', e => {
+      if (l !== raw) acc.error = acc.error ?? DISCLAIM_FAIL;   // probe-mac fora do bundle: mesma mensagem fixa, não o ENOENT cru
+      acc.error = acc.error ?? `não consegui iniciar o ${provider === 'claude' ? 'Claude' : 'Codex'}: ${(e as NodeJS.ErrnoException).code ?? 'erro'}`;
+      done(null);
+    });
     // espera o stdout esvaziar um instante depois da saída (o readline pode ter linhas pendentes)
-    child.on('exit', code => { turn.live = false; setTimeout(() => done(code), 300); });
+    child.on('exit', code => {
+      turn.live = false;
+      if (code === DISCLAIM_UNAVAILABLE && l !== raw) acc.error = acc.error ?? DISCLAIM_FAIL;
+      setTimeout(() => done(code), 300);
+    });
   }
 
   function stop(): void {
@@ -343,7 +491,10 @@ export function createAgent(deps: AgentDeps) {
 
     async send(provider: AgentProvider, text: string): Promise<SendResult> {
       if (busy) return { erro: 'já estou respondendo', status: 409 };
-      if (!deps.launch && !exists[provider]) return { erro: MISSING[provider], status: 503 };
+      // achado de novo a cada turno: instalar o CLI depois não exige reiniciar (custo: alguns stat)
+      // ponytail: entre o safeExe e o spawn há uma janela de microssegundos; quem consegue trocar o binário nela já escreve na pasta do usuário e venceria de qualquer jeito.
+      const exe = deps.launch ? undefined : (deps.findCli ?? findCliHere)(provider) ?? null;
+      if (exe === null) return { erro: missing(provider), status: 503 };
       if (conv.provider !== provider) {
         // sessões não passam de um provedor para o outro: conversa nova (R25/D14)
         if (conv.messages.length) console.log(`[agente] provedor mudou de ${conv.provider} para ${provider}: conversa nova`);
@@ -355,7 +506,7 @@ export function createAgent(deps: AgentDeps) {
       save();
       busy = true;
       emit({ type: 'start', conversation: conv.id, provider });
-      try { runTurn(provider, text); }
+      try { runTurn(provider, text, exe); }
       catch (e) {
         void finish(current, conv.id, provider, { ...newAcc(), error: `não consegui iniciar: ${e instanceof Error ? e.message : 'erro'}` }, null, null, '');
       }

@@ -92,6 +92,23 @@ Fora da v1: disco, otimizar, organizar, desinstalar, MCP para agentes, partícul
   continua para conversar e para o que precisa de julgamento. Pedido do Antônio: "fique monitorando o
   desempenho e traga opções, eu dou o ok e ele já resolve". (2026-10-18)
 
+## Mac (port de 2026-10)
+Pedido do Vittorio, num MacBook Air M2 com 8 GB (swap em ~4 GB, disco em 81 %): as duas dores são Mac lento e disco
+cheio. Branch `mac-port` no fork `vittoriofbrun-blip/folga`; **um código só** para os dois sistemas, e o Windows do
+Antônio não pode quebrar (CI com `windows-latest` + `macos-latest`). Vira PR para `FainowAI/folga` no fim.
+- **Entregue:** memória (Cmd+Q no lugar de `WM_CLOSE`, pressão do sistema e swap, Auto Care por pressão), armazenamento
+  com o bloco novo "Dados dos apps" (tamanho por app; limpa só cache recriável, nunca denylist), app de barra de menus
+  `Folga.app` com janela WebKit, avisos (travamentos, FileVault/Gatekeeper/SIP no lugar do antivírus) e o assistente
+  pelos CLIs já logados.
+- **Decisões D-Mac 1–21:** estão numeradas no spec `docs/superpowers/specs/2026-10-20-folga-mac-design.md` (seções por
+  plano); não repetir aqui. As que mais mudam o dia a dia: 4 (Cmd+Q), 17 (sem Acesso Total ao Disco), 18 (barra mostra
+  só a memória), 19 (pegada ~180/~350 MB aceita), 20 (aviso crítico notifica), 21 (sem itens de login).
+- **Em aberto:** (1) notificações do tipo toast: o `usernoted` recusa o Folga como cliente (`UNErrorDomain 1`); investigação
+  e matriz de testes em ADR 0007; hoje os avisos são o contador no menu e a tela Avisos. (2) O login do CLI do Claude
+  expirou no Mac do Vittorio: o assistente com Claude pede `claude` logado de novo. (3) Para o Antônio, do lado
+  Windows: `web_search` desligado e recursos extras do Codex, aviso crítico que notifica, e o bloco "Dados dos apps"
+  (decisão 7) com a allowlist de `%LOCALAPPDATA%`/`%APPDATA%`.
+
 ## Perguntas abertas (decisão do Antônio)
 Todas as perguntas abaixo foram decididas em 2026-10-18 (D11 a D13); os valores seguem ajustáveis em Ajustes.
 - **P01** — Nome do app. "Folga" é provisório. Não pode ser "Mint".

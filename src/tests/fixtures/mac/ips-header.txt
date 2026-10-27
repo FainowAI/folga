@@ -1,0 +1,1 @@
+{"app_name":"node","timestamp":"2026-10-21 11:20:04.00 -0300","app_version":"","slice_uuid":"00000000-0000-0000-0000-000000000000","build_version":"","platform":1,"share_with_app_devs":1,"is_first_party":1,"bug_type":"309","os_version":"macOS 26.5.1 (25F80)","roots_installed":0,"incident_id":"00000000-0000-0000-0000-000000000000","name":"node"}

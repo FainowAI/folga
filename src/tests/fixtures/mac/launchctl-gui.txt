@@ -1,0 +1,16 @@
+gui/501 = {
+	services = {
+		       0      1 	com.exemplo.credit-caio-acorda
+		     829      - 	application.com.anthropic.claudefordesktop.130839700.130839706
+		   69694   (pe) 	com.apple.syncdefaultsd
+		   93580   (pe) 	com.apple.assistantd
+		       0      - 	com.apple.DataDetectorsLocalSources
+		       0      - 	com.apple.unmountassistant.useragent
+	}
+
+	disabled services = {
+		"com.google.keystone.user.xpcservice" => enabled
+		"com.apple.Siri.agent" => enabled
+		"com.apple.ManagedClientAgent.enrollagent" => disabled
+		"com.exemplo.credit-gateway" => disabled
+	}

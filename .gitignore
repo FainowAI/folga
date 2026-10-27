@@ -7,3 +7,4 @@ skill-observations/
 # logs de outro projeto (MCP do WhatsApp) que estavam na pasta; têm dados de pareamento
 mcp-logs.txt
 wa-logs.txt
+build/

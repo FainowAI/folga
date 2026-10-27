@@ -16,7 +16,9 @@ const CPU_WINDOW_MS = 30_000;
 const BUSY_RELEASE = 0.6;   // R04: ocupado só volta a parado abaixo de 60 % da linha (3 % no padrão de 5 %)
 // R29: navegador Chromium fechado janela por janela reabre só a última (visto em scripts/qa-chrome.ts).
 // ponytail: Edge, Brave e os outros são o mesmo motor (inferido, só o Chrome foi testado); Firefox sem teste.
-const CHROMIUM = new Set(['chrome', 'msedge', 'brave', 'vivaldi', 'opera', 'chromium']);
+// No Mac a chave é o bundle id: mesma lista do `chromium` de probe/probe-mac.swift.
+const CHROMIUM = new Set(['chrome', 'msedge', 'brave', 'vivaldi', 'opera', 'chromium',
+  'com.google.chrome', 'com.microsoft.edgemac', 'com.brave.browser', 'com.vivaldi.vivaldi', 'com.operasoftware.opera', 'org.chromium.chromium']);
 const SELF_KEY = '__self';
 
 export function appKey(name: string): string {

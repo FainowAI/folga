@@ -76,3 +76,10 @@
   .arq-foot { padding-left: 28px; padding-right: 28px; }
   .arq-body { padding-left: 28px; padding-right: 28px; }
 }
+
+/* dados dos apps */
+.arq-app + .arq-app { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.arq-app-head { display: flex; justify-content: space-between; gap: 16px; margin: 0; font-size: 14px; }
+.arq-app > .arq-cat-note { margin: 0 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.arq-app-chk { width: 18px; height: 18px; margin: 0 10px 0 0; accent-color: var(--accent); cursor: pointer; vertical-align: middle; }
+.arq-app-chk:disabled { cursor: not-allowed; }
